@@ -194,6 +194,26 @@ if TYPE_CHECKING:
     ] = "relax"
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = False
+    VLLM_MOE_AG_RS_ROUTE_AFTER_GATHER: bool = False
+    VLLM_CE_A2A_MIN_ROWS: int = 2048
+    VLLM_CE_A2A_MAX_EDGE_ROWS: int = 8192
+    VLLM_CE_A2A_PACKET_BUILDER: Literal[
+        "reference", "fixed", "fused"
+    ] = "reference"
+    VLLM_CE_A2A_CONTROL: Literal[
+        "host_sync", "device_proxy", "native_proxy", "graph_proxy"
+    ] = "host_sync"
+    VLLM_CE_A2A_CONTROL_RING_DEPTH: int = 128
+    VLLM_CE_A2A_PROXY_CPU: int = -1
+    VLLM_CE_A2A_PROXY_WINDOW: int = 1
+    VLLM_CE_A2A_SCHEDULER: Literal[
+        "edge_credits",
+        "edge_stream_memops",
+        "cyclic_barrier",
+    ] = "edge_credits"
+    VLLM_CE_A2A_DISPATCH_BITS: int = 0
+    VLLM_CE_A2A_COMBINE_BITS: int = 0
+    VLLM_CE_A2A_CODEC_GROUP: int = 128
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
@@ -1522,6 +1542,54 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # treats topk_id == -1 as a skip sentinel; off by default because not all
     # kernels support it yet.
     "VLLM_MOE_SKIP_PADDING": lambda: bool(int(os.getenv("VLLM_MOE_SKIP_PADDING", "0"))),
+    # Experimental decode-oriented AG/RS schedule: gather only activations,
+    # then run the replicated router over the gathered rows.
+    "VLLM_MOE_AG_RS_ROUTE_AFTER_GATHER": lambda: bool(
+        int(os.getenv("VLLM_MOE_AG_RS_ROUTE_AFTER_GATHER", "0"))
+    ),
+    # Experimental single-host exact-size P2P copy-engine MoE A2A. Calls
+    # below MIN_ROWS stay on the graph-compatible NCCL AG/RS path.
+    "VLLM_CE_A2A_MIN_ROWS": lambda: int(
+        os.getenv("VLLM_CE_A2A_MIN_ROWS", "2048")
+    ),
+    "VLLM_CE_A2A_MAX_EDGE_ROWS": lambda: int(
+        os.getenv("VLLM_CE_A2A_MAX_EDGE_ROWS", "8192")
+    ),
+    "VLLM_CE_A2A_PACKET_BUILDER": env_with_choices(
+        "VLLM_CE_A2A_PACKET_BUILDER",
+        "reference",
+        ["reference", "fixed", "fused"],
+    ),
+    "VLLM_CE_A2A_CONTROL": env_with_choices(
+        "VLLM_CE_A2A_CONTROL",
+        "host_sync",
+        ["host_sync", "device_proxy", "native_proxy", "graph_proxy"],
+    ),
+    "VLLM_CE_A2A_CONTROL_RING_DEPTH": lambda: int(
+        os.getenv("VLLM_CE_A2A_CONTROL_RING_DEPTH", "128")
+    ),
+    "VLLM_CE_A2A_PROXY_CPU": lambda: int(
+        os.getenv("VLLM_CE_A2A_PROXY_CPU", "-1")
+    ),
+    "VLLM_CE_A2A_PROXY_WINDOW": lambda: int(
+        os.getenv("VLLM_CE_A2A_PROXY_WINDOW", "1")
+    ),
+    "VLLM_CE_A2A_SCHEDULER": env_with_choices(
+        "VLLM_CE_A2A_SCHEDULER",
+        "edge_credits",
+        ["edge_credits", "edge_stream_memops", "cyclic_barrier"],
+    ),
+    # Activation width on each CE leg, where 0 keeps the FP16 wire. Only the
+    # payload is narrowed; route metadata and scales stay exact.
+    "VLLM_CE_A2A_DISPATCH_BITS": lambda: int(
+        os.getenv("VLLM_CE_A2A_DISPATCH_BITS", "0")
+    ),
+    "VLLM_CE_A2A_COMBINE_BITS": lambda: int(
+        os.getenv("VLLM_CE_A2A_COMBINE_BITS", "0")
+    ),
+    "VLLM_CE_A2A_CODEC_GROUP": lambda: int(
+        os.getenv("VLLM_CE_A2A_CODEC_GROUP", "128")
+    ),
     # Allow use of FlashInfer FP8 block-scale GEMM for linear layers.
     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).
     "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": lambda: bool(

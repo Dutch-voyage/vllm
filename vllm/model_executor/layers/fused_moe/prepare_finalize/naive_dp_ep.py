@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
-from vllm.distributed import get_ep_group
+from vllm.distributed import get_dp_group, get_ep_group
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceContiguous,
@@ -84,6 +86,12 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         super().__init__()
         self.is_sequence_parallel = is_sequence_parallel
         self._num_dispatchers = num_dispatchers
+        self._route_after_gather = envs.VLLM_MOE_AG_RS_ROUTE_AFTER_GATHER
+        if self._route_after_gather and self.is_sequence_parallel:
+            raise ValueError(
+                "VLLM_MOE_AG_RS_ROUTE_AFTER_GATHER currently supports only "
+                "TP=1, non-sequence-parallel DP/EP"
+            )
         # Set by FusedMoEWithLoRA.set_mapping() when LoRA is active. When
         # present, prepare() dispatches the per-token LoRA mapping alongside
         # hidden_states and writes the gathered result back to the context so
@@ -108,6 +116,35 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
 
     def output_is_reduced(self) -> bool:
         return False
+
+    @staticmethod
+    def _dp_layout() -> tuple[object, list[int]]:
+        group = get_dp_group()
+        dp_metadata = get_forward_context().dp_metadata
+        assert dp_metadata is not None
+        sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
+        assert sizes is not None
+        return group, sizes
+
+    def dispatch_before_routing(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor | None:
+        if not self._route_after_gather:
+            return None
+        if self._lora_context is not None:
+            raise NotImplementedError(
+                "route-after-gather ablation does not support MoE LoRA"
+            )
+        group, sizes = self._dp_layout()
+        assert sizes[group.rank_in_group] == hidden_states.shape[0]
+        return group.all_gatherv(hidden_states, dim=0, sizes=sizes)
+
+    def allocate_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if not self._route_after_gather:
+            return super().allocate_output(hidden_states)
+        group, sizes = self._dp_layout()
+        local_rows = sizes[group.rank_in_group]
+        return torch.empty_like(hidden_states[:local_rows])
 
     def prepare(
         self,
@@ -146,6 +183,16 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
                     : a1.shape[0]
                 ]
             )
+
+        if self._route_after_gather:
+            if local_token_lora_mapping is not None:
+                raise NotImplementedError(
+                    "route-after-gather ablation does not support MoE LoRA"
+                )
+            # The runner already gathered activations, then ran the replicated
+            # router on those global rows. Dynamic activation scales, when
+            # present, were therefore also computed from global rows here.
+            return a1q, a1q_scale_orig, None, topk_ids, topk_weights
 
         extra_tensors: list[torch.Tensor] | None = None
         if scales is not None:

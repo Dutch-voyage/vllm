@@ -761,6 +761,27 @@ class MoERunner(MoERunnerInterface):
 
         return hidden_states, router_logits
 
+    def _maybe_dispatch_before_routing(
+        self,
+        hidden_states: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        moe_kernel = self._quant_method.moe_kernel
+        if moe_kernel is None or moe_kernel.is_monolithic:
+            return hidden_states
+        dispatched = moe_kernel.prepare_finalize.dispatch_before_routing(hidden_states)
+        if dispatched is None:
+            return hidden_states
+        if self.gate is None:
+            raise RuntimeError(
+                "route-after-gather requires an internal replicated gate"
+            )
+        if shared_experts_input is not None:
+            raise NotImplementedError(
+                "route-after-gather ablation does not support shared experts"
+            )
+        return dispatched
+
     def _maybe_combine(
         self,
         shared_output: torch.Tensor | None,
@@ -808,17 +829,21 @@ class MoERunner(MoERunnerInterface):
         # Sync aux and main stream for shared expert multi-stream overlap.
         self._maybe_sync_shared_experts_stream(shared_experts_input)
 
-        # If the Runner holds the gate, apply it after the stream sync,
-        # so it can run overlapped with the
-        # NOTE: in future PR, MoE runner will always hold the gate.
-        if self.gate is not None:
-            if self._fse_fuse_gate:
-                self._maybe_fuse_gate_weights()
-                router_logits = F.linear(hidden_states, self._combined_gate_weight)
-            else:
-                router_logits, _ = self.gate(hidden_states)
-
         with self._sequence_parallel_context():
+            hidden_states = self._maybe_dispatch_before_routing(
+                hidden_states, shared_experts_input
+            )
+
+            # If the Runner holds the gate, apply it after the stream sync and
+            # any opt-in activation-only dispatch.
+            # NOTE: in future PR, MoE runner will always hold the gate.
+            if self.gate is not None:
+                if self._fse_fuse_gate:
+                    self._maybe_fuse_gate_weights()
+                    router_logits = F.linear(hidden_states, self._combined_gate_weight)
+                else:
+                    router_logits, _ = self.gate(hidden_states)
+
             # TODO(bnell): parts of the dispatch/combine steps will go away once
             # #32567 lands and the remaining kernels are made MKs.  The PCP
             # code will probably remain

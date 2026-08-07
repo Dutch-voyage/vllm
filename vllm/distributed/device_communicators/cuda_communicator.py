@@ -141,6 +141,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 self.all2all_manager = AgRsAll2AllManager(
                     self.cpu_group, tcp_store_group
                 )
+            elif self.all2all_backend == "ce_a2a":
+                from .ce_a2a import CeA2AAll2AllManager
+
+                self.all2all_manager = CeA2AAll2AllManager(
+                    self.cpu_group,
+                    tcp_store_group,
+                    device_group=self.device_group,
+                )
             elif self.all2all_backend == "deepep_high_throughput":
                 from .all2all import DeepEPHTAll2AllManager
 

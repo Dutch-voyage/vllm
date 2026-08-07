@@ -261,6 +261,20 @@ class FusedMoEPrepareAndFinalizeModular(FusedMoEPrepareAndFinalize):
     described above for the Modular case.
     """
 
+    def dispatch_before_routing(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Optionally dispatch activations before the router runs.
+
+        Returning ``None`` keeps the normal modular ordering, where routing is
+        local and ``prepare`` dispatches activations plus routing metadata.
+        """
+        return None
+
+    def allocate_output(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Allocate the rank-local output before ``prepare`` dispatches input."""
+        return torch.empty_like(hidden_states)
+
     @abstractmethod
     def prepare(
         self,
@@ -1470,7 +1484,7 @@ class FusedMoEKernelModularImpl:
         Returns:
         - torch.Tensor: The output tensor after applying the MoE layer.
         """
-        output = torch.empty_like(hidden_states)
+        output = self.prepare_finalize.allocate_output(hidden_states)
 
         local_num_experts = w1.shape[0]
         if global_num_experts == -1:
