@@ -214,6 +214,21 @@ if TYPE_CHECKING:
     VLLM_CE_A2A_DISPATCH_BITS: int = 0
     VLLM_CE_A2A_COMBINE_BITS: int = 0
     VLLM_CE_A2A_CODEC_GROUP: int = 128
+    VLLM_CE_A2A_COMBINE_FILL: bool = False
+    VLLM_CE_A2A_COMBINE_LADDER_G: int = 0
+    VLLM_CE_A2A_DELTA_DISPATCH: bool = False
+    VLLM_CE_A2A_DELTA_MARGIN: float = 1.0
+    VLLM_CE_A2A_DELTA_PERIOD: int = 0
+    VLLM_CE_A2A_NUM_MOE_LAYERS: int = 0
+    VLLM_CE_A2A_DELTA_PROBE: bool = False
+    VLLM_CE_A2A_COMBINE_LAYER_PERIOD: int = 0
+    VLLM_CE_A2A_COMBINE_LAYER_LOW: int = 0
+    VLLM_CE_A2A_COMBINE_LAYER_RANGE: str = ""
+    VLLM_CE_A2A_SKEW_BIAS: float = 0.0
+    VLLM_CE_A2A_SKEW_MODE: Literal["fixed", "rolled"] = "fixed"
+    VLLM_CE_A2A_SKEW_RESAMPLE: bool = False
+    VLLM_CE_A2A_SKEW_LOG: str = ""
+    VLLM_CE_A2A_SKEW_LOG_CAPACITY: int = 65536
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
@@ -1589,6 +1604,69 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_CE_A2A_CODEC_GROUP": lambda: int(
         os.getenv("VLLM_CE_A2A_CODEC_GROUP", "128")
+    ),
+    # Give every light combine edge the widest ladder that still fits inside
+    # the busiest edge's byte budget. The exchange waits on its slowest edge,
+    # so the extra bits on the others are free.
+    "VLLM_CE_A2A_COMBINE_FILL": lambda: bool(
+        int(os.getenv("VLLM_CE_A2A_COMBINE_FILL", "0"))
+    ),
+    # Fixed fractional combine width: upgrade the first g of 16 groups in each
+    # row to the next bit, for base + g/16 bits per element. The fill solves
+    # for this, so setting both is an error.
+    "VLLM_CE_A2A_COMBINE_LADDER_G": lambda: int(
+        os.getenv("VLLM_CE_A2A_COMBINE_LADDER_G", "0")
+    ),
+    # Code the dispatch activation against what the destination already holds
+    # for that token, per group, whichever of the two has the narrower range.
+    "VLLM_CE_A2A_DELTA_DISPATCH": lambda: bool(
+        int(os.getenv("VLLM_CE_A2A_DELTA_DISPATCH", "0"))
+    ),
+    # How much flatter the residual has to be before the sender prefers it.
+    # One takes it whenever it is locally better, which measures far worse
+    # than never predicting; zero is direct everywhere. The useful range is
+    # 0.5 to 0.7.
+    "VLLM_CE_A2A_DELTA_MARGIN": lambda: float(
+        os.getenv("VLLM_CE_A2A_DELTA_MARGIN", "1.0")
+    ),
+    # Dispatches per forward pass. A token index only names the same token
+    # within a pass, so the references are dropped when one ends.
+    "VLLM_CE_A2A_DELTA_PERIOD": lambda: int(
+        os.getenv("VLLM_CE_A2A_DELTA_PERIOD", "0")
+    ),
+    "VLLM_CE_A2A_NUM_MOE_LAYERS": lambda: int(
+        os.getenv("VLLM_CE_A2A_NUM_MOE_LAYERS", "0")
+    ),
+    # The knobs below drive experiments rather than deployments: per-layer
+    # width schedules, a residual-span probe, and a synthetic routing skew.
+    # They are registered so that a typo in one is reported rather than
+    # silently ignored.
+    "VLLM_CE_A2A_DELTA_PROBE": lambda: bool(
+        int(os.getenv("VLLM_CE_A2A_DELTA_PROBE", "0"))
+    ),
+    "VLLM_CE_A2A_COMBINE_LAYER_PERIOD": lambda: int(
+        os.getenv("VLLM_CE_A2A_COMBINE_LAYER_PERIOD", "0")
+    ),
+    "VLLM_CE_A2A_COMBINE_LAYER_LOW": lambda: int(
+        os.getenv("VLLM_CE_A2A_COMBINE_LAYER_LOW", "0")
+    ),
+    "VLLM_CE_A2A_COMBINE_LAYER_RANGE": lambda: os.getenv(
+        "VLLM_CE_A2A_COMBINE_LAYER_RANGE", ""
+    ),
+    "VLLM_CE_A2A_SKEW_BIAS": lambda: float(
+        os.getenv("VLLM_CE_A2A_SKEW_BIAS", "0")
+    ),
+    "VLLM_CE_A2A_SKEW_MODE": env_with_choices(
+        "VLLM_CE_A2A_SKEW_MODE",
+        "fixed",
+        ["fixed", "rolled"],
+    ),
+    "VLLM_CE_A2A_SKEW_RESAMPLE": lambda: bool(
+        int(os.getenv("VLLM_CE_A2A_SKEW_RESAMPLE", "0"))
+    ),
+    "VLLM_CE_A2A_SKEW_LOG": lambda: os.getenv("VLLM_CE_A2A_SKEW_LOG", ""),
+    "VLLM_CE_A2A_SKEW_LOG_CAPACITY": lambda: int(
+        os.getenv("VLLM_CE_A2A_SKEW_LOG_CAPACITY", "65536")
     ),
     # Allow use of FlashInfer FP8 block-scale GEMM for linear layers.
     # This uses TensorRT-LLM kernels and requires SM90+ (Hopper).

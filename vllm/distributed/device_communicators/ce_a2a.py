@@ -93,6 +93,22 @@ def _codec_bits(name: str, value: int) -> int:
     return value
 
 
+def _ladder_views(arena: torch.Tensor, value_bytes: int):
+    """Split one fixed-stride arena into the pair of tensors the ladder wants.
+
+    The codec addresses codes by row pitch and scales as ``[world, rows,
+    groups]``, but the transport moves exactly one buffer per phase, so both have
+    to live inside it: each row is its codes followed by its scales. These are
+    views, not copies -- the arena itself is what goes on the wire.
+    """
+
+    world, rows, row_bytes = (int(dim) for dim in arena.shape)
+    return (
+        arena.view(world, rows * row_bytes),
+        arena[:, :, value_bytes:].view(torch.float16),
+    )
+
+
 def _global_num_experts(hf_config: Any) -> int:
     for name in ("num_experts", "n_routed_experts", "num_local_experts"):
         value = getattr(hf_config, name, None)
@@ -337,6 +353,34 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         if skew_mode not in ("fixed", "rolled"):
             raise ValueError("VLLM_CE_A2A_SKEW_MODE must be fixed or rolled")
         self.skew_rolled = skew_mode == "rolled"
+        self.delta_dispatch = bool(
+            int(os.environ.get("VLLM_CE_A2A_DELTA_DISPATCH", "0") or 0)
+        )
+        # How many dispatches make one forward pass. Token indices only name the
+        # same token within a pass, so the references are dropped when one ends.
+        # Getting this wrong costs compression on the first layer of a pass, not
+        # correctness: both sides read the same stale reference and stay in step.
+        self.delta_period = int(
+            os.environ.get("VLLM_CE_A2A_DELTA_PERIOD", "0") or 0
+        )
+        # How much flatter the residual has to be before the sender prefers it.
+        # One takes delta whenever it is better at this layer; zero never takes
+        # it. Below one the sender declines marginal wins, on the theory that a
+        # residual buys little accuracy but inherits the reference's structure.
+        self.delta_margin = float(
+            os.environ.get("VLLM_CE_A2A_DELTA_MARGIN", "1.0") or 1.0
+        )
+        if self.delta_dispatch and not 0.0 <= self.delta_margin <= 1.0:
+            raise ValueError("VLLM_CE_A2A_DELTA_MARGIN scales a ratio: [0, 1]")
+        if self.delta_dispatch and not self.dispatch_bits:
+            raise ValueError("delta dispatch codes a residual, so it needs a width")
+        if self.delta_dispatch and self.packet_builder_kind != "fused":
+            raise ValueError("delta dispatch requires the fused packet builder")
+        self.delta_probe = bool(
+            int(os.environ.get("VLLM_CE_A2A_DELTA_PROBE", "0") or 0)
+        )
+        self.delta_span_ratio: list[float] = []
+        self._probe_state: tuple = ()
         skew_log = os.environ.get("VLLM_CE_A2A_SKEW_LOG", "").strip()
         self.skew_recorder = (
             _SkewRecorder(
@@ -350,6 +394,74 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             if skew_log
             else None
         )
+        # Fractional combine width: promote the first g of each row's groups to
+        # base+1 bits, giving an average of base + g/groups. The width is uniform
+        # across destinations here, which is what lets the row pitch stay fixed
+        # and the transport stay untouched; a per-destination g would need the
+        # segmented exchange. Zero keeps the plain integer codec.
+        self.combine_ladder_g = int(
+            os.environ.get("VLLM_CE_A2A_COMBINE_LADDER_G", "0") or 0
+        )
+        # Whole-bit-per-layer allocation: run `low` layers out of every `period`
+        # at the base width and the rest a bit above it. E34 found the per-row
+        # ladder sits inside the frontier its two rails define, and predicted
+        # that spending the bit per layer instead lands on that line -- this is
+        # the knob that tests the prediction. Expressed through the ladder
+        # because its kernels take a caller-supplied row pitch, so a narrow layer
+        # can be packed into an arena sized for a wide one; the plain integer
+        # packer derives its pitch from the width and cannot.
+        self.combine_layer_period = int(
+            os.environ.get("VLLM_CE_A2A_COMBINE_LAYER_PERIOD", "0") or 0
+        )
+        self.combine_layer_low = int(
+            os.environ.get("VLLM_CE_A2A_COMBINE_LAYER_LOW", "0") or 0
+        )
+        if not 0 <= self.combine_layer_low <= self.combine_layer_period:
+            raise ValueError("COMBINE_LAYER_LOW must lie within COMBINE_LAYER_PERIOD")
+        # A modular schedule interleaves, which blurs exactly the structure E35
+        # says is there: narrowing 36 layers cost a quarter of what the last 12
+        # cost, so sensitivity is concentrated somewhere, and depth is the first
+        # place to look. A contiguous range answers "where" in four runs.
+        self.combine_layer_span: tuple[int, int] | None = None
+        span = os.environ.get("VLLM_CE_A2A_COMBINE_LAYER_RANGE", "").strip()
+        if span:
+            start, _, end = span.partition(":")
+            self.combine_layer_span = (int(start), int(end))
+            self.combine_layer_period = 1  # selects the layer-mix path below
+        # Needed only by the range form, which unlike the modular one cannot
+        # rely on the layer count dividing the period.
+        self.moe_layers = int(os.environ.get("VLLM_CE_A2A_NUM_MOE_LAYERS", "0") or 0)
+        if self.combine_layer_span and self.moe_layers <= 0:
+            raise ValueError("COMBINE_LAYER_RANGE needs NUM_MOE_LAYERS")
+        # The fill: give every combine edge the widest ladder it can carry inside
+        # the busiest edge's byte budget. The exchange waits on its busiest link
+        # (E24), so the heavy edge stays at the base width and sets the step time
+        # exactly as a uniform base exchange would, and every lighter edge's extra
+        # bits ride in slack that was being discarded.
+        #
+        # Sender and receiver have to agree on the width without another round
+        # trip. They do, because the width is a function of the *edge* row count
+        # and one global budget: rank s sending to r uses recv_counts_s[r], rank r
+        # decoding from s uses send_counts_r[s], and those are the same number.
+        self.combine_fill = bool(
+            int(os.environ.get("VLLM_CE_A2A_COMBINE_FILL", "0") or 0)
+        )
+        if self.combine_fill and self.combine_layer_period:
+            raise ValueError("the fill and layer mixing are exclusive")
+        if self.combine_fill and self.combine_ladder_g:
+            raise ValueError("the fill solves the width; do not also fix it")
+        if self.combine_fill and not self.combine_bits:
+            raise ValueError("the fill needs a base width in COMBINE_BITS")
+        if self.combine_layer_period and self.combine_ladder_g:
+            raise ValueError("layer mixing and a fixed ladder width are exclusive")
+        if (self.combine_ladder_g or self.combine_layer_period) and (
+            not self.combine_bits
+        ):
+            raise ValueError("the combine ladder needs a base width in COMBINE_BITS")
+        # Layers run in a fixed order, so counting entries into dispatch -- both
+        # the admitted ones and the ones that fall back -- recovers the index.
+        self.layer_calls = 0
+        self.layer_index = 0
 
         self.transport: Any | None = None
         self.packet_spec: Any | None = None
@@ -361,8 +473,22 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self.fixed_recv_hidden: torch.Tensor | None = None
         self.fixed_recv_ids: torch.Tensor | None = None
         self.fixed_recv_weights: torch.Tensor | None = None
+        self.dispatch_reference: torch.Tensor | None = None
         self.combine_recv_blocks: torch.Tensor | None = None
         self.combine_send_blocks: torch.Tensor | None = None
+        self.combine_value_bytes = 0
+        self.combine_ladder: torch.Tensor | None = None
+        self.combine_ladder_recv: torch.Tensor | None = None
+        self.combine_floor_row = 0
+        self.combine_ladder_step = 0
+        self.combine_groups = 0
+        self.combine_peak: torch.Tensor | None = None
+        self.combine_send_row_bytes: torch.Tensor | None = None
+        self.combine_recv_row_bytes: torch.Tensor | None = None
+        # Kept as device tensors and only read in diagnostics(), which runs off
+        # the hot path, so recording the matrix costs no synchronization.
+        self.last_combine_send_counts: torch.Tensor | None = None
+        self.last_combine_recv_counts: torch.Tensor | None = None
         self._active: _CeExchange | str | None = None
         self.ce_dispatch_calls = 0
         self.ce_combine_calls = 0
@@ -443,14 +569,42 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             top_k=top_k,
             activation_bits=self.dispatch_bits or 16,
             group_size=self.codec_group_size,
+            carry_token_id=self.delta_dispatch,
         )
-        self.combine_row_bytes = (
-            lowbit_block_payload_bytes(
+        if self.combine_layer_period or self.combine_fill:
+            # Sized for the wide rail, since some layers use it and the arena is
+            # allocated once. The narrow layers therefore save no bytes here;
+            # this configuration measures accuracy, and E34 already established
+            # that the leg is linear in bytes at 457 ms per KB of row.
+            #
+            # The fill is in the same position for a different reason. Its edges
+            # only ever get *wider* than the base, and its claim is that the peak
+            # edge is unchanged -- which is a statement about bytes per edge, not
+            # about the arena. Realizing it on the wire needs a per-edge copy
+            # length in the native proxy's ABI; until then the widths are real and
+            # the accuracy they buy is measurable, but the peak is conservative.
+            self.combine_ladder_g = hidden_size // self.codec_group_size
+        if self.combine_ladder_g:
+            from ce_a2a_moe.ladder import ladder_row_bytes, ladder_value_bytes
+
+            self.combine_value_bytes = ladder_value_bytes(
+                hidden_size,
+                self.combine_bits,
+                self.combine_ladder_g,
+                self.codec_group_size,
+            )
+            self.combine_row_bytes = ladder_row_bytes(
+                hidden_size,
+                self.combine_bits,
+                self.combine_ladder_g,
+                self.codec_group_size,
+            )
+        elif self.combine_bits:
+            self.combine_row_bytes = lowbit_block_payload_bytes(
                 hidden_size, self.combine_bits, self.codec_group_size
             )
-            if self.combine_bits
-            else hidden_size * 2
-        )
+        else:
+            self.combine_row_bytes = hidden_size * 2
         if self.packet_builder_kind in ("fixed", "fused"):
             builder_type = (
                 FusedBlockDispatchBuilder
@@ -464,6 +618,19 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 max_edge_rows=self.max_edge_rows,
                 device=torch.cuda.current_device(),
             )
+            if self.delta_dispatch:
+                # Both sides hold one row per peer and token: the sender for
+                # what each destination can rebuild, the receiver for what it
+                # has rebuilt from each source. A rank never exceeds
+                # max_edge_rows local tokens or dispatch falls back.
+                self.packet_builder.enable_delta(
+                    self.max_edge_rows, margin=self.delta_margin
+                )
+                self.dispatch_reference = torch.zeros(
+                    (self.world_size, self.max_edge_rows, hidden_size),
+                    dtype=torch.float16,
+                    device=torch.cuda.current_device(),
+                )
         self.transport = CoalescedCeTransport(
             max_edge_rows=self.max_edge_rows,
             dispatch_row_bytes=self.packet_spec.packet_bytes,
@@ -510,6 +677,44 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     device=torch.cuda.current_device(),
                 )
                 self.combine_recv_blocks = torch.empty_like(self.combine_send_blocks)
+                if self.combine_ladder_g:
+                    # Uniform across destinations, so the kernels still take a
+                    # per-destination vector but every entry is the same and the
+                    # row pitch is a constant the transport can be sized against.
+                    self.combine_ladder = torch.full(
+                        (self.world_size,),
+                        self.combine_ladder_g,
+                        dtype=torch.int32,
+                        device=torch.cuda.current_device(),
+                    )
+                    if self.combine_fill:
+                        from ce_a2a_moe.ladder import (
+                            ladder_group_bytes as _group_bytes,
+                            ladder_row_bytes as _row_bytes,
+                        )
+
+                        # Packing is indexed by destination and reduction by
+                        # source, and under the fill those are different vectors
+                        # of the same count matrix, so they cannot share storage.
+                        self.combine_ladder_recv = torch.zeros_like(
+                            self.combine_ladder
+                        )
+                        # The wire widths the two ladders imply, kept as their
+                        # own buffers because the control path stages them to
+                        # pinned host memory and must not race the solver.
+                        self.combine_send_row_bytes = torch.zeros_like(
+                            self.combine_ladder
+                        )
+                        self.combine_recv_row_bytes = torch.zeros_like(
+                            self.combine_ladder
+                        )
+                        self.combine_floor_row = _row_bytes(
+                            hidden_size, self.combine_bits, 0, self.codec_group_size
+                        )
+                        self.combine_ladder_step = _group_bytes(
+                            self.codec_group_size, self.combine_bits + 1
+                        ) - _group_bytes(self.codec_group_size, self.combine_bits)
+                        self.combine_groups = hidden_size // self.codec_group_size
             else:
                 self.combine_recv_blocks = torch.empty(
                     (self.world_size, block_rows, hidden_size),
@@ -546,6 +751,8 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         send_counts: torch.Tensor,
         recv: torch.Tensor,
         recv_counts: torch.Tensor,
+        send_row_bytes: torch.Tensor | None = None,
+        recv_row_bytes: torch.Tensor | None = None,
     ) -> None:
         assert self.control is not None
         if self.control_kind == "graph_proxy":
@@ -559,12 +766,30 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 phase,
             )
             return
+        if send_row_bytes is None:
+            self.control.submit(
+                "dispatch" if phase == 0 else "combine",
+                send,
+                send_counts,
+                recv,
+                recv_counts,
+            )
+            return
+        # Only the native proxy carries per-edge widths; the other controls
+        # would silently send the arena pitch and corrupt every narrow edge.
+        if self.control_kind != "native_proxy":
+            raise RuntimeError(
+                f"combine fill needs VLLM_CE_A2A_CONTROL=native_proxy, "
+                f"got {self.control_kind}"
+            )
         self.control.submit(
             "dispatch" if phase == 0 else "combine",
             send,
             send_counts,
             recv,
             recv_counts,
+            send_row_bytes,
+            recv_row_bytes,
         )
 
     def dispatch_router_logits(
@@ -586,6 +811,20 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             extra_tensors,
         )
 
+    def _solve_fill(self, counts: torch.Tensor, peak: torch.Tensor, out: torch.Tensor):
+        """Widest ``g`` each edge can carry inside the busiest edge's budget.
+
+        Entirely on device: ``counts`` and ``peak`` are the count tensors the
+        control path already keeps in GPU memory, so nothing here forces the D2H
+        synchronisation the fixed-control path exists to avoid.
+        """
+
+        budget = peak.to(torch.int64) * self.combine_floor_row
+        safe = counts.to(torch.int64).clamp(min=1)
+        g = (budget // safe - self.combine_floor_row) // self.combine_ladder_step
+        g = g.clamp(0, self.combine_groups)
+        out.copy_(torch.where(counts > 0, g, torch.zeros_like(g)).to(torch.int32))
+
     def dispatch(
         self,
         hidden_states: torch.Tensor,
@@ -596,6 +835,11 @@ class CeA2AAll2AllManager(All2AllManagerBase):
     ):
         if self._active is not None:
             raise RuntimeError("CE A2A dispatch called before the prior combine")
+
+        # Counted before the admission gate, so the index still tracks the layer
+        # when a wave falls back to NCCL.
+        self.layer_index = self.layer_calls
+        self.layer_calls += 1
 
         comm_group = self._get_comm_group(is_sequence_parallel)
         sizes = self._get_sizes(int(hidden_states.shape[0]), comm_group)
@@ -650,6 +894,30 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     rolled=self.skew_rolled,
                 )
 
+        if self.delta_probe and self.delta_dispatch:
+            # Delta is worth a bit only if the residual's per-group range is
+            # smaller than the activation's, since that range is what sets the
+            # quantizer's step. Measured against destination zero's reference,
+            # which is the real state of that edge rather than an idealization.
+            assert self.packet_builder is not None
+            rows = int(hidden_states.shape[0])
+            groups = hidden_size // self.codec_group_size
+            held = self.packet_builder.reference[0, :rows]
+            span = hidden_states.view(rows, groups, -1).abs().amax(-1)
+            residual_span = (
+                (hidden_states - held).view(rows, groups, -1).abs().amax(-1)
+            )
+            ratio = float((residual_span / span.clamp_min(1e-6)).mean())
+            self.delta_span_ratio.append(ratio)
+            self._probe_state = (rows, groups, topk_ids)
+
+        if self.delta_dispatch and self.delta_period:
+            if self.ce_dispatch_calls % self.delta_period == 0:
+                assert self.packet_builder is not None
+                assert self.dispatch_reference is not None
+                self.packet_builder.reset_delta()
+                self.dispatch_reference.zero_()
+
         with record_function("moe.ce_a2a.coalesce_pack"):
             if self.packet_builder_kind in ("fixed", "fused"):
                 assert self.packet_builder is not None
@@ -658,6 +926,8 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     topk_ids,
                     topk_weights,
                 )
+                if self.delta_probe and self.delta_dispatch:
+                    self._report_delta_error(hidden_states)
             else:
                 coalesced = build_dispatch_packets(
                     hidden_states,
@@ -684,6 +954,16 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         coalesced.send_counts,
                         group=self.device_group,
                     )
+                    if self.combine_fill:
+                        # The budget has to be identical on every rank or the
+                        # two ends of an edge would solve different widths. A
+                        # max-reduce over the count vectors gives the busiest
+                        # edge in the whole matrix, in 16 bytes.
+                        peak = coalesced.send_counts.clone()
+                        dist.all_reduce(
+                            peak, op=dist.ReduceOp.MAX, group=self.device_group
+                        )
+                        self.combine_peak = peak.max()
             if self.control_kind != "host_sync":
                 assert self.control is not None
                 assert self.dispatch_recv_blocks is not None
@@ -731,6 +1011,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         output_hidden=self.fixed_recv_hidden,
                         output_ids=self.fixed_recv_ids,
                         output_weights=self.fixed_recv_weights,
+                        reference=self.dispatch_reference,
                     )
                 )
             self._active = _CeExchange(
@@ -827,7 +1108,79 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 )
             hidden_size = int(hidden_states.shape[1])
             blocks = hidden_states.reshape(self.world_size, block_rows, hidden_size)
-            if self.combine_bits:
+            if isinstance(active.recv_counts, torch.Tensor):
+                self.last_combine_send_counts = active.recv_counts
+                self.last_combine_recv_counts = active.send_counts
+            if self.combine_ladder_g:
+                assert self.combine_send_blocks is not None
+                from ce_a2a_moe.ladder import quantize_pack_ladder_blocks
+
+                if self.combine_layer_period:
+                    if self.combine_layer_span is not None:
+                        start, end = self.combine_layer_span
+                        depth = self.layer_index % self.moe_layers
+                        narrow = start <= depth < end
+                    else:
+                        # Narrow rail for the first `low` layers of each period.
+                        narrow = (
+                            self.layer_index % self.combine_layer_period
+                        ) < self.combine_layer_low
+                    self.combine_ladder.fill_(0 if narrow else self.combine_ladder_g)
+                if self.combine_fill:
+                    assert self.combine_peak is not None
+                    # Packing is indexed by destination, so it solves from the
+                    # rows this rank returns to each owner; the reduction below
+                    # is indexed by source and solves from the mirror vector.
+                    self._solve_fill(
+                        active.recv_counts, self.combine_peak, self.combine_ladder
+                    )
+                    self._solve_fill(
+                        active.send_counts,
+                        self.combine_peak,
+                        self.combine_ladder_recv,
+                    )
+                    assert self.combine_send_row_bytes is not None
+                    assert self.combine_recv_row_bytes is not None
+                    torch.add(
+                        self.combine_ladder * self.combine_ladder_step,
+                        self.combine_floor_row,
+                        out=self.combine_send_row_bytes,
+                    )
+                    torch.add(
+                        self.combine_ladder_recv * self.combine_ladder_step,
+                        self.combine_floor_row,
+                        out=self.combine_recv_row_bytes,
+                    )
+                with record_function("moe.ce_a2a.combine_pack"):
+                    if self.combine_fill:
+                        # Each destination's rows go out at that destination's
+                        # own dense pitch with the scales inside the row, so its
+                        # block is one contiguous run the transport can send
+                        # without also sending the padding up to the widest.
+                        from ce_a2a_moe.ladder import quantize_pack_ladder_inline
+
+                        quantize_pack_ladder_inline(
+                            blocks,
+                            self.combine_send_blocks,
+                            self.combine_ladder,
+                            base_bits=self.combine_bits,
+                            group_size=self.codec_group_size,
+                        )
+                    else:
+                        values, scales = _ladder_views(
+                            self.combine_send_blocks, self.combine_value_bytes
+                        )
+                        quantize_pack_ladder_blocks(
+                            blocks,
+                            values,
+                            scales,
+                            self.combine_ladder,
+                            base_bits=self.combine_bits,
+                            group_size=self.codec_group_size,
+                            row_pitch=self.combine_row_bytes,
+                        )
+                    blocks = self.combine_send_blocks
+            elif self.combine_bits:
                 assert self.combine_send_blocks is not None
                 with record_function("moe.ce_a2a.combine_pack"):
                     blocks = quantize_pack_combine_blocks(
@@ -844,9 +1197,41 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         active.recv_counts,
                         self.combine_recv_blocks,
                         active.send_counts,
+                        self.combine_send_row_bytes if self.combine_fill else None,
+                        self.combine_recv_row_bytes if self.combine_fill else None,
                     )
             with record_function("moe.ce_a2a.owner_reduce"):
-                if self.combine_bits:
+                if self.combine_fill:
+                    from ce_a2a_moe.ladder import reduce_ladder_inline
+
+                    output = reduce_ladder_inline(
+                        self.combine_recv_blocks,
+                        self.combine_ladder_recv,
+                        active.token_positions,
+                        block_rows=block_rows,
+                        local_rows=active.local_rows,
+                        hidden_size=hidden_size,
+                        base_bits=self.combine_bits,
+                        group_size=self.codec_group_size,
+                    )
+                elif self.combine_ladder_g:
+                    from ce_a2a_moe.ladder import reduce_ladder_owner_partials
+
+                    values, scales = _ladder_views(
+                        self.combine_recv_blocks, self.combine_value_bytes
+                    )
+                    output = reduce_ladder_owner_partials(
+                        values,
+                        scales,
+                        self.combine_ladder,
+                        active.token_positions,
+                        local_rows=active.local_rows,
+                        hidden_size=hidden_size,
+                        base_bits=self.combine_bits,
+                        group_size=self.codec_group_size,
+                        row_pitch=self.combine_row_bytes,
+                    )
+                elif self.combine_bits:
                     output = reduce_packed_owner_partials(
                         self.combine_recv_blocks,
                         active.token_positions,
@@ -890,6 +1275,39 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self.ce_combine_calls += 1
         return output
 
+    def _report_delta_error(self, hidden_states: torch.Tensor) -> None:
+        """Compare what delta actually rebuilt against plain quantization.
+
+        The reference after a build is the reconstruction the receiver holds,
+        so the error is measurable on the sender without any extra exchange.
+        Only rows that routed to destination zero are scored, since the others
+        left that reference untouched.
+        """
+
+        rows, groups, topk_ids = self._probe_state
+        held = self.packet_builder.reference[0, :rows]
+        routed = (topk_ids // self.experts_per_rank == 0).any(dim=1)
+        if not bool(routed.any()):
+            return
+        truth = hidden_states[routed].float()
+        rebuilt = held[routed].float()
+        bits = self.dispatch_bits
+        limit = 2 ** (bits - 1) - 1
+        blocked = truth.view(-1, groups, self.codec_group_size)
+        step = (blocked.abs().amax(-1, True) / limit).clamp_min(1e-8)
+        plain = ((blocked / step).round().clamp(-limit, limit) * step).view_as(truth)
+        scale = truth.square().sum().sqrt().clamp_min(1e-8)
+        delta_error = float((rebuilt - truth).square().sum().sqrt() / scale)
+        plain_error = float((plain - truth).square().sum().sqrt() / scale)
+        index = len(self.delta_span_ratio) - 1
+        if self.rank == 0 and index < 96:
+            print(
+                f"[delta_probe] dispatch {index} "
+                f"span_ratio {self.delta_span_ratio[-1]:.4f} "
+                f"delta_err {delta_error:.5f} direct_err {plain_error:.5f}",
+                flush=True,
+            )
+
     def diagnostics(self) -> dict[str, Any]:
         result: dict[str, Any] = {
             "backend": "ce_a2a",
@@ -898,6 +1316,10 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             "packet_builder": self.packet_builder_kind,
             "control": self.control_kind,
             "dispatch_bits": self.dispatch_bits or 16,
+            "dispatch_delta": self.delta_dispatch,
+            "dispatch_delta_margin": self.delta_margin,
+            "delta_span_ratio": self.delta_span_ratio,
+            "dispatch_delta_period": self.delta_period,
             "combine_bits": self.combine_bits or 16,
             "codec_group_size": self.codec_group_size,
             "ce_dispatch_calls": self.ce_dispatch_calls,
@@ -907,6 +1329,32 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             "capacity_fallbacks": self.capacity_fallbacks,
             "unsupported_fallbacks": self.unsupported_fallbacks,
             "transport_initialized": self.transport is not None,
+            # The per-layer schedule keys off this counter, so its alignment is
+            # load-bearing: a total that is not a whole number of stacks means
+            # some layer skipped a dispatch and every index after it is wrong.
+            "combine_fill": self.combine_fill,
+            # One row of the combine count matrix per rank; collecting all four
+            # reconstructs it, which is what prices any per-edge scheme.
+            "combine_send_counts": (
+                None if self.last_combine_send_counts is None
+                else [int(v) for v in self.last_combine_send_counts.tolist()]
+            ),
+            "combine_recv_counts": (
+                None if self.last_combine_recv_counts is None
+                else [int(v) for v in self.last_combine_recv_counts.tolist()]
+            ),
+            "combine_ladder_send": (
+                None if self.combine_ladder is None
+                else [int(v) for v in self.combine_ladder.tolist()]
+            ),
+            "combine_ladder_recv": (
+                None if self.combine_ladder_recv is None
+                else [int(v) for v in self.combine_ladder_recv.tolist()]
+            ),
+            "layer_calls": self.layer_calls,
+            "layer_calls_mod_stack": (
+                self.layer_calls % self.moe_layers if self.moe_layers else None
+            ),
         }
         if self.transport is not None:
             result["transport"] = self.transport.diagnostics()
