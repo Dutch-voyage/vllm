@@ -5,7 +5,7 @@ from typing import Any
 
 import torch
 
-from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
+from vllm.distributed import get_tp_group
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
     FusedMoEMethodBase,
@@ -188,6 +188,61 @@ def is_layer_skipped_quant(prefix: str, modules_to_not_convert: list[str]):
     return any(module_name in prefix for module_name in modules_to_not_convert)
 
 
+def parse_autoround_expert_weight_name(
+    name: str,
+) -> tuple[str, int, tuple[str, ...]] | None:
+    """Map Intel AutoRound's per-expert names to fused vLLM parameters."""
+    marker = ".mlp.experts."
+    if marker not in name:
+        return None
+
+    prefix, suffix = name.split(marker, maxsplit=1)
+    parts = suffix.split(".")
+    if len(parts) != 3:
+        return None
+
+    projection, expert_id_text, tensor_type = parts
+    if not expert_id_text.isdigit() or tensor_type not in {
+        "qweight",
+        "qzeros",
+        "scales",
+        "bias",
+    }:
+        return None
+
+    if projection == "gate_up_projs":
+        fused_stem = "w13"
+        shard_ids = ("w1", "w3")
+    elif projection == "down_projs":
+        fused_stem = "w2"
+        shard_ids = ("w2",)
+    else:
+        return None
+
+    fused_name = (
+        f"{prefix}{marker}routed_experts.{fused_stem}_{tensor_type}"
+    )
+    return fused_name, int(expert_id_text), shard_ids
+
+
+def repeat_and_trim_group_quant_metadata(
+    loaded_weight: torch.Tensor,
+    repeat_factor: int,
+    target_group_count: int,
+) -> torch.Tensor:
+    """Expand metadata after reducing group size and discard padded groups."""
+    if repeat_factor == 1:
+        return loaded_weight
+
+    loaded_weight = loaded_weight.repeat_interleave(repeat_factor, dim=1)
+    if loaded_weight.size(1) < target_group_count:
+        raise ValueError(
+            "Expanded group metadata is smaller than its destination: "
+            f"{loaded_weight.size(1)} < {target_group_count}."
+        )
+    return loaded_weight.narrow(1, 0, target_group_count)
+
+
 class MoeWNA16Method(FusedMoEMethodBase):
     """Linear method for MOE WNA16 (W8A16/W4A16) quantization.
 
@@ -244,6 +299,18 @@ class MoeWNA16Method(FusedMoEMethodBase):
         layer.register_parameter("w13_qweight", w13_qweight)
         set_weight_attrs(w13_qweight, extra_weight_attrs)
 
+        if self.moe.has_bias:
+            w13_bias = torch.nn.Parameter(
+                torch.zeros(
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    dtype=params_dtype,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_bias", w13_bias)
+            set_weight_attrs(w13_bias, extra_weight_attrs)
+
         # down_proj (row parallel)
         w2_qweight = torch.nn.Parameter(
             torch.empty(
@@ -256,6 +323,14 @@ class MoeWNA16Method(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_qweight", w2_qweight)
         set_weight_attrs(w2_qweight, extra_weight_attrs)
+
+        if self.moe.has_bias:
+            w2_bias = torch.nn.Parameter(
+                torch.zeros(num_experts, hidden_size, dtype=params_dtype),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_bias", w2_bias)
+            set_weight_attrs(w2_bias, extra_weight_attrs)
 
         w13_scales = torch.nn.Parameter(
             torch.zeros(
@@ -336,6 +411,8 @@ class MoeWNA16Method(FusedMoEMethodBase):
             w2_scale=layer.w2_scales,
             w1_zp=layer.w13_qzeros if has_zp else None,
             w2_zp=layer.w2_qzeros if has_zp else None,
+            w1_bias=getattr(layer, "w13_bias", None),
+            w2_bias=getattr(layer, "w2_bias", None),
             block_shape=[0, layer.group_size],
         )
 
@@ -425,9 +502,39 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 return False if return_success else None
 
             device = get_tp_group().device
-            tp_rank = get_tensor_model_parallel_rank()
+            # Expert parallelism flattens the outer TP group while keeping
+            # each local expert unsharded. Use the MoE-local TP rank here.
+            tp_rank = layer.moe_config.tp_rank
             loaded_weight = loaded_weight.to(device)
             shard_size = layer.intermediate_size_per_partition
+
+            # A row-parallel down projection contributes its bias only once.
+            # This fallback predates generic RoutedExperts bias loading, so
+            # handle expert mapping and w13 TP slicing here.
+            if "bias" in weight_name:
+                local_expert_id = layer._map_global_expert_id_to_local_expert_id(
+                    expert_id
+                )
+                if local_expert_id == -1:
+                    return False if return_success else None
+
+                expert_data = param.data[local_expert_id]
+                if shard_id == "w2":
+                    if tp_rank != 0:
+                        loaded_weight = torch.zeros_like(loaded_weight)
+                    expert_data.copy_(loaded_weight)
+                else:
+                    tp_size = layer.moe_config.tp_size
+                    loaded_per_rank = loaded_weight.size(0) // tp_size
+                    loaded_weight = loaded_weight.narrow(
+                        0, tp_rank * loaded_per_rank, loaded_per_rank
+                    )
+                    shard_size = expert_data.size(0) // 2
+                    shard_offset = 0 if shard_id == "w1" else shard_size
+                    expert_data.narrow(0, shard_offset, shard_size).copy_(
+                        loaded_weight
+                    )
+                return True if return_success else None
 
             # convert gptq and awq weight to a standard format
             # awq_marlin uses the same weight format as awq
@@ -454,13 +561,13 @@ class MoeWNA16Method(FusedMoEMethodBase):
                     loaded_weight = loaded_weight.T
 
             # repeat the qzeros/scales to fit new group size
-            if (
-                layer.group_size_div_factor > 1
-                and "qzeros" in weight_name
-                or "scales" in weight_name
+            if layer.group_size_div_factor > 1 and (
+                "qzeros" in weight_name or "scales" in weight_name
             ):
-                loaded_weight = loaded_weight.repeat_interleave(
-                    layer.group_size_div_factor, 1
+                loaded_weight = repeat_and_trim_group_quant_metadata(
+                    loaded_weight,
+                    repeat_factor=layer.group_size_div_factor,
+                    target_group_count=param.size(-1),
                 )
 
             if "w13_qzeros" in weight_name:

@@ -63,6 +63,7 @@ def fused_moe_kernel_gptq_awq(
     a_ptr,
     b_ptr,
     c_ptr,
+    b_bias_ptr,
     b_scale_ptr,
     b_zp_ptr,
     topk_weights_ptr,
@@ -85,6 +86,8 @@ def fused_moe_kernel_gptq_awq(
     stride_bn,
     stride_cm,
     stride_cn,
+    stride_bbe,
+    stride_bbn,
     stride_bse,
     stride_bsk,
     stride_bsn,
@@ -103,6 +106,7 @@ def fused_moe_kernel_gptq_awq(
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     has_zp: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
 ):
@@ -277,6 +281,11 @@ def fused_moe_kernel_gptq_awq(
             b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
         else:
             b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if HAS_BIAS:
+        bias_ptrs = b_bias_ptr + off_experts * stride_bbe + offs_bn * stride_bbn
+        bias = tl.load(bias_ptrs, mask=(offs_bn < N), other=0.0)
+        accumulator += bias[None, :]
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
@@ -660,6 +669,7 @@ def invoke_fused_moe_wna16_triton_kernel(
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
     block_shape: list[int] | None,
+    B_bias: torch.Tensor | None = None,
 ):
     assert B_scale is not None and B_scale.ndim == 3
     assert B_zp is None or B_zp.ndim == 3
@@ -693,11 +703,15 @@ def invoke_fused_moe_wna16_triton_kernel(
             block_size_m=config["BLOCK_SIZE_M"],
         )
     )
+    # Small CUDA batches normally use the CUDA WNA16 kernel, whose config
+    # omits this Triton-only launch parameter. Bias forces the Triton path.
+    config.setdefault("GROUP_SIZE_M", 1)
 
     fused_moe_kernel_gptq_awq[grid](
         A,
         B,
         C,
+        B_bias,
         B_scale,
         B_zp,
         topk_weights,
@@ -715,6 +729,8 @@ def invoke_fused_moe_wna16_triton_kernel(
         B.stride(1),
         C.stride(1),
         C.stride(2),
+        B_bias.stride(0) if B_bias is not None else 0,
+        B_bias.stride(1) if B_bias is not None else 0,
         B_scale.stride(0),
         B_scale.stride(2),
         B_scale.stride(1),
@@ -727,6 +743,7 @@ def invoke_fused_moe_wna16_triton_kernel(
         top_k=top_k,
         compute_type=compute_type,
         has_zp=B_zp is not None,
+        HAS_BIAS=B_bias is not None,
         use_int4_w4a16=use_int4_w4a16,
         use_int8_w8a16=use_int8_w8a16,
         **config,
@@ -883,9 +900,7 @@ def dispatch_fused_moe_kernel(
     if (use_int8_w8a16 or use_int4_w4a16) and (
         block_shape is not None and block_shape[1] > 0
     ):
-        assert B_bias is None
-
-        use_moe_wna16_cuda = should_moe_wna16_use_cuda(
+        use_moe_wna16_cuda = B_bias is None and should_moe_wna16_use_cuda(
             num_valid_tokens=num_tokens,
             group_size=block_shape[1],
             num_experts=B.size(0),
@@ -926,6 +941,7 @@ def dispatch_fused_moe_kernel(
             use_int8_w8a16,
             use_int4_w4a16,
             block_shape,
+            B_bias,
         )
 
     else:

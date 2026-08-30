@@ -33,6 +33,10 @@ from vllm.model_executor.layers.quantization.inc.schemes.inc_wna16_scheme import
     _resolve_awq_moe,
     _resolve_gptq_moe,
 )
+from vllm.model_executor.layers.quantization.moe_wna16 import (
+    parse_autoround_expert_weight_name,
+    repeat_and_trim_group_quant_metadata,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.platforms import current_platform
 
@@ -97,6 +101,65 @@ class DummyLayer:
 
 class DummyFusedMoE:
     pass
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_name", "expected"),
+    [
+        (
+            "model.layers.3.mlp.experts.gate_up_projs.7.qweight",
+            (
+                "model.layers.3.mlp.experts.routed_experts.w13_qweight",
+                7,
+                ("w1", "w3"),
+            ),
+        ),
+        (
+            "model.layers.3.mlp.experts.down_projs.7.scales",
+            (
+                "model.layers.3.mlp.experts.routed_experts.w2_scales",
+                7,
+                ("w2",),
+            ),
+        ),
+        (
+            "model.layers.3.mlp.experts.gate_up_projs.7.bias",
+            (
+                "model.layers.3.mlp.experts.routed_experts.w13_bias",
+                7,
+                ("w1", "w3"),
+            ),
+        ),
+        ("model.layers.3.mlp.router.weight", None),
+        ("model.layers.3.mlp.experts.gate_up_projs.bad.qweight", None),
+    ],
+)
+def test_parse_gpt_oss_autoround_expert_weight_name(
+    checkpoint_name: str,
+    expected: tuple[str, int, tuple[str, ...]] | None,
+) -> None:
+    assert parse_autoround_expert_weight_name(checkpoint_name) == expected
+
+
+def test_repeat_and_trim_group_quant_metadata() -> None:
+    metadata = torch.tensor([[1.0, 2.0, 3.0]])
+
+    expanded = repeat_and_trim_group_quant_metadata(
+        metadata,
+        repeat_factor=2,
+        target_group_count=5,
+    )
+
+    torch.testing.assert_close(expanded, torch.tensor([[1.0, 1.0, 2.0, 2.0, 3.0]]))
+
+
+def test_repeat_and_trim_group_quant_metadata_rejects_short_input() -> None:
+    with pytest.raises(ValueError, match="smaller than its destination"):
+        repeat_and_trim_group_quant_metadata(
+            torch.tensor([[1.0, 2.0]]),
+            repeat_factor=2,
+            target_group_count=5,
+        )
 
 
 def make_config(**overrides) -> INCConfig:

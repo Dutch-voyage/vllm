@@ -33,6 +33,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.moe_wna16 import (
+    parse_autoround_expert_weight_name,
+)
 from vllm.model_executor.layers.quantization.utils.ocp_mx_utils import OCP_MX_BLOCK_SIZE
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.utils import rocm_unquantized_gemm
@@ -1018,6 +1021,33 @@ class GptOssModel(nn.Module, EagleModelMixin):
             if is_pp_missing_parameter(name, self):
                 continue
 
+            autoround_expert = parse_autoround_expert_weight_name(name)
+            if autoround_expert is not None:
+                fused_name, expert_id, shard_ids = autoround_expert
+                param = params_dict.get(fused_name)
+                if param is None:
+                    continue
+
+                expert_shards = (
+                    weight.chunk(2, dim=-1)
+                    if len(shard_ids) == 2
+                    else (weight,)
+                )
+                weight_loader = typing.cast(Callable[..., bool], param.weight_loader)
+                loaded = False
+                for shard_id, expert_shard in zip(shard_ids, expert_shards):
+                    loaded |= weight_loader(
+                        param,
+                        expert_shard,
+                        weight_name=fused_name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                        return_success=True,
+                    )
+                if loaded:
+                    loaded_params.add(fused_name)
+                continue
+
             if ".w13_weight" in name:
                 # Handle MLP gate and up projection weights
                 # Extract gate and up projection parts
@@ -1176,6 +1206,7 @@ class GptOssForCausalLM(
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_substr={
             ".self_attn.": ".attn.",
+            ".mlp.router.router.": ".mlp.router.",
         },
         orig_to_new_suffix={
             ".embed_tokens.weight": ".embedding.weight",
