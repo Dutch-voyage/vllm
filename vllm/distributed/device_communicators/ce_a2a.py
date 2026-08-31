@@ -111,6 +111,65 @@ def _value_row_bytes(hidden_size: int, bits: int, group_size: int) -> int:
     return groups * ((group_size * bits + 7) // 8)
 
 
+def _pace_policy_name(
+    dispatch_bits: int,
+    combine_bits: int,
+    delta_dispatch: bool,
+    delta_max_edge: bool,
+    combine_fill: bool,
+) -> str:
+    """Return the locked experiment arm selected by the codec policy."""
+
+    policy = (
+        int(dispatch_bits),
+        int(combine_bits),
+        bool(delta_dispatch),
+        bool(delta_max_edge),
+        bool(combine_fill),
+    )
+    arms = {
+        (0, 0, False, False, False): "fp16",
+        (6, 6, False, False, False): "uniform_int6",
+        (5, 6, True, True, False): "maxedge_delta_5to6",
+        (6, 6, False, False, True): "lightedge_fill_6to7",
+        (5, 6, True, True, True): "maxedge_delta_plus_fill",
+    }
+    return arms.get(policy, "custom")
+
+
+def _solve_max_edge_dispatch_plan(
+    counts: list[int], spec: Any, peak_count: int
+) -> tuple[list[int], list[int]]:
+    """Solve exact promoted groups and aligned packet widths for one rank."""
+
+    from ce_a2a_moe.packet import (
+        dispatch_ladder_packet_bytes,
+        solve_max_edge_dispatch_ladder,
+    )
+
+    promoted = solve_max_edge_dispatch_ladder(
+        [int(value) for value in counts],
+        spec,
+        int(peak_count),
+    )
+    row_bytes = [
+        dispatch_ladder_packet_bytes(spec, groups) for groups in promoted
+    ]
+    return promoted, row_bytes
+
+
+def _dispatch_ladder_value_row_bytes(
+    hidden_size: int,
+    base_bits: int,
+    group_size: int,
+    promoted_groups: torch.Tensor,
+) -> torch.Tensor:
+    """Return code-only row widths for value-effective-bit accounting."""
+
+    base = _value_row_bytes(hidden_size, base_bits, group_size)
+    return promoted_groups * (group_size // 8) + base
+
+
 def _to_ce_wire(tensor: torch.Tensor) -> torch.Tensor:
     """Return the FP16 tensor carried by the CE wire codec."""
 
@@ -465,6 +524,15 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             raise ValueError("delta dispatch codes a residual, so it needs a width")
         if self.delta_dispatch and self.packet_builder_kind != "fused":
             raise ValueError("delta dispatch requires the fused packet builder")
+        self.delta_max_edge = envs.VLLM_CE_A2A_DELTA_MAX_EDGE
+        if self.delta_max_edge and not self.delta_dispatch:
+            raise ValueError("DELTA_MAX_EDGE builds on delta dispatch")
+        if self.delta_max_edge and self.dispatch_bits != 5:
+            raise ValueError("DELTA_MAX_EDGE implements the locked INT5-to-INT6 arm")
+        if self.delta_max_edge and self.control_kind != "native_proxy":
+            raise ValueError(
+                "DELTA_MAX_EDGE uses per-edge row widths and needs native_proxy"
+            )
         self.delta_probe = bool(
             int(os.environ.get("VLLM_CE_A2A_DELTA_PROBE", "0") or 0)
         )
@@ -547,6 +615,13 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             not self.combine_bits
         ):
             raise ValueError("the combine ladder needs a base width in COMBINE_BITS")
+        self.pace_policy = _pace_policy_name(
+            self.dispatch_bits,
+            self.combine_bits,
+            self.delta_dispatch,
+            self.delta_max_edge,
+            self.combine_fill,
+        )
         # Layers run in a fixed order, so counting entries into dispatch -- both
         # the admitted ones and the ones that fall back -- recovers the index.
         self.layer_calls = 0
@@ -559,6 +634,16 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self._control_handle: int | None = None
         self.recv_counts_device: torch.Tensor | None = None
         self.dispatch_recv_blocks: torch.Tensor | None = None
+        self.dispatch_row_bytes = 0
+        self.dispatch_floor_row = 0
+        self.dispatch_groups = 0
+        self.dispatch_peak: torch.Tensor | None = None
+        self.dispatch_ladder: torch.Tensor | None = None
+        self.dispatch_ladder_recv: torch.Tensor | None = None
+        self.dispatch_send_row_bytes: torch.Tensor | None = None
+        self.dispatch_recv_row_bytes: torch.Tensor | None = None
+        self.last_dispatch_send_counts: torch.Tensor | None = None
+        self.last_dispatch_recv_counts: torch.Tensor | None = None
         self.fixed_recv_hidden: torch.Tensor | None = None
         self.fixed_recv_ids: torch.Tensor | None = None
         self.fixed_recv_weights: torch.Tensor | None = None
@@ -608,6 +693,8 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self.ce_combine_payload_bytes = 0
         self._ce_wire_bytes_device: torch.Tensor | None = None
         self._ce_payload_bytes_device: torch.Tensor | None = None
+        self._dispatch_effective_inputs_device: torch.Tensor | None = None
+        self.adaptive_dispatch_fallbacks: dict[str, int] = {}
         logger.info_once(
             "CE A2A enabled for global rows >= %d "
             "(edge capacity=%d, scheduler=%s, packet_builder=%s, control=%s, "
@@ -695,6 +782,10 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self.nccl_dispatch_calls += 1
         self.last_dispatch_path = "nccl"
         self.last_fallback_reason = reason
+        if self.delta_max_edge:
+            self.adaptive_dispatch_fallbacks[reason] = (
+                self.adaptive_dispatch_fallbacks.get(reason, 0) + 1
+            )
         if reason == "unsupported":
             self.unsupported_fallbacks += 1
         elif reason == "capacity":
@@ -739,6 +830,17 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             group_size=self.codec_group_size,
             carry_token_id=self.delta_dispatch,
         )
+        self.dispatch_row_bytes = self.packet_spec.packet_bytes
+        if self.delta_max_edge:
+            from ce_a2a_moe.packet import dispatch_ladder_packet_bytes
+
+            self.dispatch_floor_row = dispatch_ladder_packet_bytes(
+                self.packet_spec, 0
+            )
+            self.dispatch_groups = self.packet_spec.groups
+            self.dispatch_row_bytes = dispatch_ladder_packet_bytes(
+                self.packet_spec, self.dispatch_groups
+            )
         if self.combine_layer_period or self.combine_fill:
             # Sized for the wide rail, since some layers use it and the arena is
             # allocated once. The narrow layers therefore save no bytes here;
@@ -779,12 +881,16 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 if self.packet_builder_kind == "fused"
                 else FixedBlockDispatchBuilder
             )
+            builder_options = {}
+            if self.delta_max_edge:
+                builder_options["max_activation_bits"] = self.dispatch_bits + 1
             self.packet_builder = builder_type(
                 spec=self.packet_spec,
                 experts_per_rank=self.experts_per_rank,
                 world_size=self.world_size,
                 max_edge_rows=self.max_edge_rows,
                 device=torch.cuda.current_device(),
+                **builder_options,
             )
             if self.delta_dispatch:
                 # Both sides hold one row per peer and token: the sender for
@@ -801,7 +907,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 )
         self.transport = CoalescedCeTransport(
             max_edge_rows=self.max_edge_rows,
-            dispatch_row_bytes=self.packet_spec.packet_bytes,
+            dispatch_row_bytes=self.dispatch_row_bytes,
             hidden_size=hidden_size,
             combine_row_bytes=self.combine_row_bytes,
             scheduler=self.scheduler,
@@ -815,6 +921,11 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self._ce_payload_bytes_device = torch.zeros_like(
             self._ce_wire_bytes_device
         )
+        self._dispatch_effective_inputs_device = torch.zeros(
+            2,
+            dtype=torch.int64,
+            device=torch.cuda.current_device(),
+        )
         if self.control_kind != "host_sync":
             block_rows = self.max_edge_rows + 1
             total_rows = self.world_size * block_rows
@@ -824,10 +935,21 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 device=torch.cuda.current_device(),
             )
             self.dispatch_recv_blocks = torch.empty(
-                (self.world_size, block_rows, self.packet_spec.packet_bytes),
+                (self.world_size, block_rows, self.dispatch_row_bytes),
                 dtype=torch.uint8,
                 device=torch.cuda.current_device(),
             )
+            if self.delta_max_edge:
+                self.dispatch_ladder = torch.zeros_like(self.recv_counts_device)
+                self.dispatch_ladder_recv = torch.zeros_like(
+                    self.recv_counts_device
+                )
+                self.dispatch_send_row_bytes = torch.zeros_like(
+                    self.recv_counts_device
+                )
+                self.dispatch_recv_row_bytes = torch.zeros_like(
+                    self.recv_counts_device
+                )
             self.fixed_recv_hidden = torch.empty(
                 (total_rows, hidden_size),
                 dtype=torch.float16,
@@ -955,7 +1077,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         # would silently send the arena pitch and corrupt every narrow edge.
         if self.control_kind != "native_proxy":
             raise RuntimeError(
-                f"combine fill needs VLLM_CE_A2A_CONTROL=native_proxy, "
+                f"variable-width PACE needs VLLM_CE_A2A_CONTROL=native_proxy, "
                 f"got {self.control_kind}"
             )
         self.control.submit(
@@ -1129,12 +1251,17 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         with record_function("moe.ce_a2a.coalesce_pack"):
             if self.packet_builder_kind in ("fixed", "fused"):
                 assert self.packet_builder is not None
-                coalesced = self.packet_builder.build(
-                    hidden_states,
-                    topk_ids,
-                    topk_weights,
-                )
-                if self.delta_probe and self.delta_dispatch:
+                if self.delta_max_edge:
+                    coalesced = self.packet_builder.prepare(
+                        hidden_states, topk_ids, topk_weights
+                    )
+                else:
+                    coalesced = self.packet_builder.build(
+                        hidden_states,
+                        topk_ids,
+                        topk_weights,
+                    )
+                if self.delta_probe and self.delta_dispatch and not self.delta_max_edge:
                     self._report_delta_error(hidden_states)
             else:
                 coalesced = build_dispatch_packets(
@@ -1147,21 +1274,6 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 )
         if self.skew_recorder is not None:
             self.skew_recorder.record(coalesced.send_counts)
-        self._record_wire_bytes(
-            0,
-            coalesced.send_counts,
-            self.packet_spec.packet_bytes,
-        )
-        self._record_wire_bytes(
-            0,
-            coalesced.send_counts,
-            _value_row_bytes(
-                hidden_size,
-                self.dispatch_bits or 16,
-                self.codec_group_size,
-            ),
-            payload=True,
-        )
 
         with record_function("moe.ce_a2a.count_exchange_d2h"):
             recv_counts_device = (
@@ -1177,16 +1289,112 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         coalesced.send_counts,
                         group=self.device_group,
                     )
-                    if self.combine_fill:
-                        # The budget has to be identical on every rank or the
-                        # two ends of an edge would solve different widths. A
-                        # max-reduce over the count vectors gives the busiest
-                        # edge in the whole matrix, in 16 bytes.
-                        peak = coalesced.send_counts.clone()
+                    if self.combine_fill or self.delta_max_edge:
+                        # The scalar reduction covers the full EP x EP matrix,
+                        # so all tied bottleneck edges stay at the floor width.
+                        peak = coalesced.send_counts.max()
                         dist.all_reduce(
                             peak, op=dist.ReduceOp.MAX, group=self.device_group
                         )
-                        self.combine_peak = peak.max()
+                        if self.combine_fill:
+                            self.combine_peak = peak
+                        if self.delta_max_edge:
+                            self.dispatch_peak = peak
+            dispatch_send_row_bytes = None
+            dispatch_recv_row_bytes = None
+            if self.delta_max_edge:
+                assert self.dispatch_peak is not None
+                assert self.dispatch_ladder is not None
+                assert self.dispatch_ladder_recv is not None
+                assert self.dispatch_send_row_bytes is not None
+                assert self.dispatch_recv_row_bytes is not None
+                assert self.packet_builder is not None
+                count_pair = torch.stack(
+                    (coalesced.send_counts, recv_counts_device), dim=0
+                ).cpu()
+                peak_count = int(self.dispatch_peak.item())
+                send_promoted, send_widths = _solve_max_edge_dispatch_plan(
+                    [int(value) for value in count_pair[0].tolist()],
+                    self.packet_spec,
+                    peak_count,
+                )
+                recv_promoted, recv_widths = _solve_max_edge_dispatch_plan(
+                    [int(value) for value in count_pair[1].tolist()],
+                    self.packet_spec,
+                    peak_count,
+                )
+                self.dispatch_ladder.copy_(
+                    torch.tensor(
+                        send_promoted,
+                        dtype=torch.int32,
+                        device=hidden_states.device,
+                    )
+                )
+                self.dispatch_ladder_recv.copy_(
+                    torch.tensor(
+                        recv_promoted,
+                        dtype=torch.int32,
+                        device=hidden_states.device,
+                    )
+                )
+                self.dispatch_send_row_bytes.copy_(
+                    torch.tensor(
+                        send_widths,
+                        dtype=torch.int32,
+                        device=hidden_states.device,
+                    )
+                )
+                self.dispatch_recv_row_bytes.copy_(
+                    torch.tensor(
+                        recv_widths,
+                        dtype=torch.int32,
+                        device=hidden_states.device,
+                    )
+                )
+                coalesced = self.packet_builder.pack_prepared_ladder(
+                    hidden_states,
+                    topk_ids,
+                    topk_weights,
+                    self.dispatch_ladder,
+                )
+                if self.delta_probe:
+                    self._report_delta_error(hidden_states)
+                self.last_dispatch_send_counts = coalesced.send_counts
+                self.last_dispatch_recv_counts = recv_counts_device
+                dispatch_send_row_bytes = self.dispatch_send_row_bytes
+                dispatch_recv_row_bytes = self.dispatch_recv_row_bytes
+                account_counts = coalesced.send_counts.to(torch.int64).clone()
+                account_counts[self.rank] = 0
+                assert self._dispatch_effective_inputs_device is not None
+                self._dispatch_effective_inputs_device[0].add_(
+                    account_counts.sum()
+                )
+                self._dispatch_effective_inputs_device[1].add_(
+                    (account_counts * self.dispatch_ladder.to(torch.int64)).sum()
+                )
+            wire_row_bytes = (
+                dispatch_send_row_bytes
+                if dispatch_send_row_bytes is not None
+                else self.packet_spec.packet_bytes
+            )
+            payload_row_bytes = (
+                _dispatch_ladder_value_row_bytes(
+                    hidden_size,
+                    self.dispatch_bits,
+                    self.codec_group_size,
+                    self.dispatch_ladder,
+                )
+                if self.delta_max_edge
+                else _value_row_bytes(
+                    hidden_size,
+                    self.dispatch_bits or 16,
+                    self.codec_group_size,
+                )
+            )
+            self._record_wire_bytes(0, coalesced.send_counts, wire_row_bytes)
+            self._record_wire_bytes(
+                0, coalesced.send_counts, payload_row_bytes, payload=True
+            )
             if self.control_kind != "host_sync":
                 assert self.control is not None
                 assert self.dispatch_recv_blocks is not None
@@ -1197,6 +1405,8 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         coalesced.send_counts,
                         self.dispatch_recv_blocks,
                         recv_counts_device,
+                        dispatch_send_row_bytes,
+                        dispatch_recv_row_bytes,
                     )
                 send_counts = coalesced.send_counts
                 recv_counts = recv_counts_device
@@ -1224,19 +1434,39 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             assert self.fixed_recv_weights is not None
             assert coalesced.token_positions is not None
             with record_function("moe.ce_a2a.unpack"):
-                recv_hidden, recv_topk_ids, recv_topk_weights = (
-                    unpack_fixed_dispatch_blocks(
-                        self.dispatch_recv_blocks,
-                        recv_counts_device,
-                        spec=self.packet_spec,
-                        expert_rank=self.rank,
-                        experts_per_rank=self.experts_per_rank,
-                        output_hidden=self.fixed_recv_hidden,
-                        output_ids=self.fixed_recv_ids,
-                        output_weights=self.fixed_recv_weights,
-                        reference=self.dispatch_reference,
+                if self.delta_max_edge:
+                    from ce_a2a_moe import unpack_ladder_dispatch_blocks
+
+                    assert self.dispatch_ladder_recv is not None
+                    assert self.dispatch_reference is not None
+                    recv_hidden, recv_topk_ids, recv_topk_weights = (
+                        unpack_ladder_dispatch_blocks(
+                            self.dispatch_recv_blocks,
+                            recv_counts_device,
+                            self.dispatch_ladder_recv,
+                            spec=self.packet_spec,
+                            expert_rank=self.rank,
+                            experts_per_rank=self.experts_per_rank,
+                            output_hidden=self.fixed_recv_hidden,
+                            output_ids=self.fixed_recv_ids,
+                            output_weights=self.fixed_recv_weights,
+                            reference=self.dispatch_reference,
+                        )
                     )
-                )
+                else:
+                    recv_hidden, recv_topk_ids, recv_topk_weights = (
+                        unpack_fixed_dispatch_blocks(
+                            self.dispatch_recv_blocks,
+                            recv_counts_device,
+                            spec=self.packet_spec,
+                            expert_rank=self.rank,
+                            experts_per_rank=self.experts_per_rank,
+                            output_hidden=self.fixed_recv_hidden,
+                            output_ids=self.fixed_recv_ids,
+                            output_weights=self.fixed_recv_weights,
+                            reference=self.dispatch_reference,
+                        )
+                    )
             self._active = _CeExchange(
                 send_counts=send_counts,
                 recv_counts=recv_counts,
@@ -1615,6 +1845,28 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         actual_combine_payload_bytes = (
             self.ce_combine_payload_bytes + device_payload_bytes[1]
         )
+        effective_inputs = (
+            (0, 0)
+            if self._dispatch_effective_inputs_device is None
+            else tuple(
+                int(value)
+                for value in self._dispatch_effective_inputs_device.tolist()
+            )
+        )
+        dispatch_value_effective_bits = None
+        dispatch_packet_effective_bits = None
+        if (
+            self.delta_max_edge
+            and effective_inputs[0]
+            and self.packet_spec is not None
+        ):
+            dispatch_value_effective_bits = self.dispatch_bits + (
+                effective_inputs[1]
+                / (effective_inputs[0] * self.dispatch_groups)
+            )
+            dispatch_packet_effective_bits = (
+                8 * actual_dispatch_wire_bytes
+            ) / (effective_inputs[0] * self.packet_spec.hidden_size)
         result: dict[str, Any] = {
             "backend": "ce_a2a",
             "min_global_rows": self.min_global_rows,
@@ -1623,6 +1875,11 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             "control": self.control_kind,
             "dispatch_bits": self.dispatch_bits or 16,
             "dispatch_delta": self.delta_dispatch,
+            "dispatch_delta_max_edge": self.delta_max_edge,
+            "pace_policy": self.pace_policy,
+            "adaptive_dispatch_fallbacks": dict(
+                self.adaptive_dispatch_fallbacks
+            ),
             "dispatch_delta_margin": self.delta_margin,
             "delta_span_ratio": self.delta_span_ratio,
             "dispatch_delta_period": self.delta_period,
@@ -1652,6 +1909,62 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             "actual_combine_payload_bytes": actual_combine_payload_bytes,
             "actual_total_payload_bytes": (
                 actual_dispatch_payload_bytes + actual_combine_payload_bytes
+            ),
+            "dispatch_effective_inputs": {
+                "remote_rows": effective_inputs[0],
+                "promoted_group_rows": effective_inputs[1],
+                "groups_per_row": self.dispatch_groups or None,
+                "base_bits": self.dispatch_bits if self.delta_max_edge else None,
+            },
+            "dispatch_value_effective_bits": dispatch_value_effective_bits,
+            "dispatch_packet_effective_bits": dispatch_packet_effective_bits,
+            "dispatch_peak_rows": (
+                None
+                if self.dispatch_peak is None
+                else int(self.dispatch_peak.item())
+            ),
+            "dispatch_send_counts": (
+                None
+                if self.last_dispatch_send_counts is None
+                else [int(v) for v in self.last_dispatch_send_counts.tolist()]
+            ),
+            "dispatch_recv_counts": (
+                None
+                if self.last_dispatch_recv_counts is None
+                else [int(v) for v in self.last_dispatch_recv_counts.tolist()]
+            ),
+            "dispatch_promoted_groups_send": (
+                None
+                if self.dispatch_ladder is None
+                else [int(v) for v in self.dispatch_ladder.tolist()]
+            ),
+            "dispatch_promoted_groups_recv": (
+                None
+                if self.dispatch_ladder_recv is None
+                else [int(v) for v in self.dispatch_ladder_recv.tolist()]
+            ),
+            "dispatch_row_bytes_send": (
+                None
+                if self.dispatch_send_row_bytes is None
+                else [int(v) for v in self.dispatch_send_row_bytes.tolist()]
+            ),
+            "dispatch_row_bytes_recv": (
+                None
+                if self.dispatch_recv_row_bytes is None
+                else [int(v) for v in self.dispatch_recv_row_bytes.tolist()]
+            ),
+            "dispatch_edge_wire_bytes_send": (
+                None
+                if self.last_dispatch_send_counts is None
+                else [
+                    0 if peer == self.rank else int(count) * int(width)
+                    for peer, (count, width) in enumerate(
+                        zip(
+                            self.last_dispatch_send_counts.tolist(),
+                            self.dispatch_send_row_bytes.tolist(),
+                        )
+                    )
+                ]
             ),
             "transport_initialized": self.transport is not None,
             # The per-layer schedule keys off this counter, so its alignment is
@@ -1713,4 +2026,11 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self.combine_send_blocks = None
         self._ce_wire_bytes_device = None
         self._ce_payload_bytes_device = None
+        self.dispatch_ladder = None
+        self.dispatch_ladder_recv = None
+        self.dispatch_send_row_bytes = None
+        self.dispatch_recv_row_bytes = None
+        self.last_dispatch_send_counts = None
+        self.last_dispatch_recv_counts = None
+        self._dispatch_effective_inputs_device = None
         self._active = None

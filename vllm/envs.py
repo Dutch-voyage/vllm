@@ -218,6 +218,7 @@ if TYPE_CHECKING:
     VLLM_CE_A2A_COMBINE_FILL: bool = False
     VLLM_CE_A2A_COMBINE_LADDER_G: int = 0
     VLLM_CE_A2A_DELTA_DISPATCH: bool = False
+    VLLM_CE_A2A_DELTA_MAX_EDGE: bool = False
     VLLM_CE_A2A_DELTA_MARGIN: float = 1.0
     VLLM_CE_A2A_DELTA_PERIOD: int = 0
     VLLM_CE_A2A_NUM_MOE_LAYERS: int = 0
@@ -1627,6 +1628,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # for that token, per group, whichever of the two has the narrower range.
     "VLLM_CE_A2A_DELTA_DISPATCH": lambda: bool(
         int(os.getenv("VLLM_CE_A2A_DELTA_DISPATCH", "0"))
+    ),
+    # Promote light-edge delta groups inside the global INT5 max-edge budget.
+    "VLLM_CE_A2A_DELTA_MAX_EDGE": lambda: bool(
+        int(os.getenv("VLLM_CE_A2A_DELTA_MAX_EDGE", "0"))
     ),
     # How much flatter the residual has to be before the sender prefers it.
     # One takes it whenever it is locally better, which measures far worse

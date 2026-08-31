@@ -11,7 +11,9 @@ from vllm.distributed.device_communicators.ce_a2a import (
     _codec_group_count,
     _forward_phase,
     _from_ce_wire,
+    _pace_policy_name,
     _prefill_policy_fallback_reason,
+    _solve_max_edge_dispatch_plan,
     _to_ce_wire,
     _value_row_bytes,
 )
@@ -111,6 +113,66 @@ def test_gptoss_group64_fused_codes_are_bit_exact(bits: int) -> None:
         torch.testing.assert_close(
             scales[start : start + count], expected_scales, rtol=0, atol=0
         )
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "top_k", "group_size"),
+    [(2048, 8, 128), (2880, 4, 64)],
+)
+def test_max_edge_plan_keeps_cross_rank_ties_int5_and_respects_budget(
+    hidden_size: int, top_k: int, group_size: int
+) -> None:
+    from ce_a2a_moe.packet import DispatchPacketSpec, dispatch_ladder_packet_bytes
+
+    spec = DispatchPacketSpec(
+        hidden_size=hidden_size,
+        top_k=top_k,
+        activation_bits=5,
+        group_size=group_size,
+        carry_token_id=True,
+    )
+    peak = 128
+    rank_rows = ([128, 73, 29, 0], [41, 128, 64, 7])
+    floor = dispatch_ladder_packet_bytes(spec, 0)
+    for counts in rank_rows:
+        promoted, widths = _solve_max_edge_dispatch_plan(counts, spec, peak)
+        assert promoted[counts.index(peak)] == 0
+        assert any(
+            groups > 0
+            for count, groups in zip(counts, promoted)
+            if count < peak
+        )
+        for count, groups, width in zip(counts, promoted, widths):
+            assert width == dispatch_ladder_packet_bytes(spec, groups)
+            assert count * width <= peak * floor
+
+
+def test_gptoss_plan_uses_exact_aligned_widths() -> None:
+    from ce_a2a_moe.packet import DispatchPacketSpec
+
+    spec = DispatchPacketSpec(
+        hidden_size=2880,
+        top_k=4,
+        activation_bits=5,
+        group_size=64,
+        carry_token_id=True,
+    )
+    promoted, widths = _solve_max_edge_dispatch_plan([100, 99], spec, 100)
+    assert promoted == [0, 2]
+    assert widths == [1928, 1944]
+    assert all(width % 4 == 0 for width in widths)
+
+
+def test_locked_five_arm_policies_select_distinct_paths() -> None:
+    policies = {
+        "fp16": (0, 0, False, False, False),
+        "uniform_int6": (6, 6, False, False, False),
+        "maxedge_delta_5to6": (5, 6, True, True, False),
+        "lightedge_fill_6to7": (6, 6, False, False, True),
+        "maxedge_delta_plus_fill": (5, 6, True, True, True),
+    }
+    selected = {_pace_policy_name(*policy) for policy in policies.values()}
+    assert selected == set(policies)
 
 
 def test_gptoss_checkpoint_group_is_not_a_valid_codec_group() -> None:
