@@ -21,7 +21,10 @@ from torch.profiler import record_function
 
 import vllm.envs as envs
 from vllm.config import get_current_vllm_config
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import (
+    get_forward_context,
+    is_forward_context_available,
+)
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -91,6 +94,86 @@ def _codec_bits(name: str, value: int) -> int:
     if value and value not in (4, 5, 6, 8):
         raise ValueError(f"{name} must be 0 (FP16) or one of 4, 5, 6, 8; got {value}")
     return value
+
+
+def _codec_group_count(hidden_size: int, group_size: int) -> int:
+    if hidden_size <= 0 or group_size <= 0 or hidden_size % group_size:
+        raise ValueError(
+            "CE A2A codec group size must be positive and divide hidden size"
+        )
+    return hidden_size // group_size
+
+
+def _value_row_bytes(hidden_size: int, bits: int, group_size: int) -> int:
+    if bits == 16:
+        return hidden_size * 2
+    groups = _codec_group_count(hidden_size, group_size)
+    return groups * ((group_size * bits + 7) // 8)
+
+
+def _to_ce_wire(tensor: torch.Tensor) -> torch.Tensor:
+    """Return the FP16 tensor carried by the CE wire codec."""
+
+    if tensor.dtype == torch.float16:
+        return tensor
+    if tensor.dtype == torch.bfloat16:
+        return tensor.to(torch.float16)
+    raise ValueError("CE A2A supports FP16 or BF16 compute activations")
+
+
+def _from_ce_wire(tensor: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("CE A2A supports FP16 or BF16 compute activations")
+    return tensor if tensor.dtype == dtype else tensor.to(dtype)
+
+
+def _attention_phase(attn_metadata: Any) -> str:
+    """Classify a model forward without synchronizing device metadata."""
+
+    pending = [attn_metadata]
+    saw_prefill = False
+    saw_decode = False
+    while pending:
+        metadata = pending.pop()
+        if metadata is None:
+            continue
+        if isinstance(metadata, dict):
+            pending.extend(metadata.values())
+            continue
+        if isinstance(metadata, (list, tuple)):
+            pending.extend(metadata)
+            continue
+
+        prefill_tokens = getattr(metadata, "num_prefill_tokens", None)
+        decode_tokens = getattr(metadata, "num_decode_tokens", None)
+        if isinstance(prefill_tokens, int):
+            saw_prefill |= prefill_tokens > 0
+        if isinstance(decode_tokens, int):
+            saw_decode |= decode_tokens > 0
+
+    if saw_prefill and saw_decode:
+        return "mixed"
+    if saw_prefill:
+        return "prefill"
+    if saw_decode:
+        return "decode"
+    return "unknown"
+
+
+def _forward_phase() -> str:
+    if not is_forward_context_available():
+        return "unknown"
+    return _attention_phase(get_forward_context().attn_metadata)
+
+
+def _prefill_policy_fallback_reason(phase: str) -> str | None:
+    if phase == "prefill":
+        return None
+    if phase == "mixed":
+        return "policy_mixed_batch"
+    if phase in ("decode", "unknown"):
+        return f"policy_{phase}"
+    raise ValueError(f"unknown CE A2A forward phase: {phase}")
 
 
 def _ladder_views(arena: torch.Tensor, value_bytes: int):
@@ -260,6 +343,7 @@ class _CeExchange:
     token_positions: torch.Tensor | None
     local_rows: int
     fixed_control: bool = False
+    output_dtype: torch.dtype = torch.float16
 
 
 class CeA2AAll2AllManager(All2AllManagerBase):
@@ -328,6 +412,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self.codec_group_size = _positive_value(
             "VLLM_CE_A2A_CODEC_GROUP", envs.VLLM_CE_A2A_CODEC_GROUP
         )
+        self.prefill_only = envs.VLLM_CE_A2A_PREFILL_ONLY
         if (self.dispatch_bits or self.combine_bits) and (
             self.packet_builder_kind != "fused"
         ):
@@ -481,6 +566,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self.combine_ladder_recv: torch.Tensor | None = None
         self.combine_floor_row = 0
         self.combine_ladder_step = 0
+        self.codec_groups = 0
         self.combine_groups = 0
         self.combine_peak: torch.Tensor | None = None
         self.combine_send_row_bytes: torch.Tensor | None = None
@@ -492,10 +578,32 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self._active: _CeExchange | str | None = None
         self.ce_dispatch_calls = 0
         self.ce_combine_calls = 0
+        self.ce_fp16_dispatch_calls = 0
+        self.ce_bf16_dispatch_calls = 0
         self.nccl_dispatch_calls = 0
         self.nccl_combine_calls = 0
         self.capacity_fallbacks = 0
         self.unsupported_fallbacks = 0
+        self.min_rows_fallbacks = 0
+        self.policy_fallbacks = {
+            "decode": 0,
+            "mixed_batch": 0,
+            "unknown": 0,
+        }
+        self.phase_dispatch_calls = {
+            "prefill": 0,
+            "decode": 0,
+            "mixed": 0,
+            "unknown": 0,
+        }
+        self.last_dispatch_path: str | None = None
+        self.last_fallback_reason: str | None = None
+        self.ce_dispatch_wire_bytes = 0
+        self.ce_combine_wire_bytes = 0
+        self.ce_dispatch_payload_bytes = 0
+        self.ce_combine_payload_bytes = 0
+        self._ce_wire_bytes_device: torch.Tensor | None = None
+        self._ce_payload_bytes_device: torch.Tensor | None = None
         logger.info_once(
             "CE A2A enabled for global rows >= %d "
             "(edge capacity=%d, scheduler=%s, packet_builder=%s, control=%s, "
@@ -523,6 +631,52 @@ class CeA2AAll2AllManager(All2AllManagerBase):
     def _get_sizes(self, num_local_tokens: int, comm_group: Any) -> list[int]:
         return self.fallback._get_sizes(num_local_tokens, comm_group)
 
+    def _record_wire_bytes(
+        self,
+        phase: int,
+        counts: tuple[int, ...] | torch.Tensor,
+        row_bytes: int | torch.Tensor,
+        *,
+        payload: bool = False,
+    ) -> None:
+        if isinstance(counts, torch.Tensor):
+            accumulator = (
+                self._ce_payload_bytes_device
+                if payload
+                else self._ce_wire_bytes_device
+            )
+            assert accumulator is not None
+            widths = row_bytes
+            if isinstance(widths, int):
+                remote = (counts.sum() - counts[self.rank]).to(torch.int64) * widths
+            else:
+                remote = (counts.to(torch.int64) * widths.to(torch.int64)).sum()
+                remote -= counts[self.rank].to(torch.int64) * widths[
+                    self.rank
+                ].to(torch.int64)
+            accumulator[phase].add_(remote)
+            return
+
+        widths = (
+            (int(row_bytes),) * self.world_size
+            if isinstance(row_bytes, int)
+            else tuple(int(value) for value in row_bytes.tolist())
+        )
+        remote = sum(
+            int(count) * widths[peer]
+            for peer, count in enumerate(counts)
+            if peer != self.rank
+        )
+        if payload:
+            if phase == 0:
+                self.ce_dispatch_payload_bytes += remote
+            else:
+                self.ce_combine_payload_bytes += remote
+        elif phase == 0:
+            self.ce_dispatch_wire_bytes += remote
+        else:
+            self.ce_combine_wire_bytes += remote
+
     def _fallback_dispatch(
         self,
         hidden_states: torch.Tensor,
@@ -531,11 +685,20 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         is_sequence_parallel: bool,
         extra_tensors: list[torch.Tensor] | None,
         *,
-        unsupported: bool = False,
+        reason: str,
     ):
         self._active = "nccl"
         self.nccl_dispatch_calls += 1
-        self.unsupported_fallbacks += int(unsupported)
+        self.last_dispatch_path = "nccl"
+        self.last_fallback_reason = reason
+        if reason == "unsupported":
+            self.unsupported_fallbacks += 1
+        elif reason == "capacity":
+            self.capacity_fallbacks += 1
+        elif reason == "min_rows":
+            self.min_rows_fallbacks += 1
+        elif reason.startswith("policy_"):
+            self.policy_fallbacks[reason.removeprefix("policy_")] += 1
         return self.fallback.dispatch(
             hidden_states,
             topk_weights,
@@ -564,6 +727,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             ):
                 raise ValueError("CE A2A v1 supports one MoE packet shape per model")
             return
+        self.codec_groups = _codec_group_count(hidden_size, self.codec_group_size)
         self.packet_spec = DispatchPacketSpec(
             hidden_size=hidden_size,
             top_k=top_k,
@@ -638,6 +802,14 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             combine_row_bytes=self.combine_row_bytes,
             scheduler=self.scheduler,
             process_group=self.device_group,
+        )
+        self._ce_wire_bytes_device = torch.zeros(
+            2,
+            dtype=torch.int64,
+            device=torch.cuda.current_device(),
+        )
+        self._ce_payload_bytes_device = torch.zeros_like(
+            self._ce_wire_bytes_device
         )
         if self.control_kind != "host_sync":
             block_rows = self.max_edge_rows + 1
@@ -804,6 +976,8 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self._active = "nccl"
         self.nccl_dispatch_calls += 1
         self.unsupported_fallbacks += 1
+        self.last_dispatch_path = "nccl"
+        self.last_fallback_reason = "unsupported_monolithic"
         return self.fallback.dispatch_router_logits(
             hidden_states,
             router_logits,
@@ -841,34 +1015,56 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self.layer_index = self.layer_calls
         self.layer_calls += 1
 
+        phase = _forward_phase()
+        self.phase_dispatch_calls[phase] += 1
+        policy_reason = _prefill_policy_fallback_reason(phase)
+        if self.prefill_only and policy_reason is not None:
+            return self._fallback_dispatch(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                is_sequence_parallel,
+                extra_tensors,
+                reason=policy_reason,
+            )
+
         comm_group = self._get_comm_group(is_sequence_parallel)
         sizes = self._get_sizes(int(hidden_states.shape[0]), comm_group)
         global_rows = sum(int(value) for value in sizes)
         unsupported = bool(
             is_sequence_parallel
             or extra_tensors is not None
-            or hidden_states.dtype != torch.float16
+            or hidden_states.dtype not in (torch.float16, torch.bfloat16)
             or topk_weights.dtype != torch.float32
             or hidden_states.ndim != 2
             or topk_ids.ndim != 2
         )
-        if unsupported or global_rows < self.min_global_rows:
+        if unsupported:
             return self._fallback_dispatch(
                 hidden_states,
                 topk_weights,
                 topk_ids,
                 is_sequence_parallel,
                 extra_tensors,
-                unsupported=unsupported,
+                reason="unsupported",
+            )
+        if global_rows < self.min_global_rows:
+            return self._fallback_dispatch(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                is_sequence_parallel,
+                extra_tensors,
+                reason="min_rows",
             )
         if max(sizes, default=0) > self.max_edge_rows:
-            self.capacity_fallbacks += 1
             return self._fallback_dispatch(
                 hidden_states,
                 topk_weights,
                 topk_ids,
                 is_sequence_parallel,
                 extra_tensors,
+                reason="capacity",
             )
 
         from ce_a2a_moe import (
@@ -878,10 +1074,18 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             unpack_fixed_dispatch_blocks,
         )
 
+        output_dtype = hidden_states.dtype
         hidden_size = int(hidden_states.shape[1])
         top_k = int(topk_ids.shape[1])
         self._ensure_transport(hidden_size, top_k)
         assert self.transport is not None and self.packet_spec is not None
+        hidden_states = _to_ce_wire(hidden_states)
+        if output_dtype == torch.bfloat16:
+            self.ce_bf16_dispatch_calls += 1
+        else:
+            self.ce_fp16_dispatch_calls += 1
+        self.last_dispatch_path = "ce_a2a"
+        self.last_fallback_reason = None
 
         if self.skew_resample:
             with record_function("moe.ce_a2a.skew_resample"):
@@ -939,6 +1143,21 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 )
         if self.skew_recorder is not None:
             self.skew_recorder.record(coalesced.send_counts)
+        self._record_wire_bytes(
+            0,
+            coalesced.send_counts,
+            self.packet_spec.packet_bytes,
+        )
+        self._record_wire_bytes(
+            0,
+            coalesced.send_counts,
+            _value_row_bytes(
+                hidden_size,
+                self.dispatch_bits or 16,
+                self.codec_group_size,
+            ),
+            payload=True,
+        )
 
         with record_function("moe.ce_a2a.count_exchange_d2h"):
             recv_counts_device = (
@@ -1021,9 +1240,14 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 token_positions=coalesced.token_positions,
                 local_rows=int(hidden_states.shape[0]),
                 fixed_control=True,
+                output_dtype=output_dtype,
             )
             self.ce_dispatch_calls += 1
-            return recv_hidden, recv_topk_weights, recv_topk_ids
+            return (
+                _from_ce_wire(recv_hidden, output_dtype),
+                recv_topk_weights,
+                recv_topk_ids,
+            )
 
         recv_packets = torch.empty(
             (sum(recv_counts), self.packet_spec.packet_bytes),
@@ -1063,9 +1287,14 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             owner_token_ids=owner_token_ids,
             token_positions=None,
             local_rows=int(hidden_states.shape[0]),
+            output_dtype=output_dtype,
         )
         self.ce_dispatch_calls += 1
-        return recv_hidden, recv_topk_weights, recv_topk_ids
+        return (
+            _from_ce_wire(recv_hidden, output_dtype),
+            recv_topk_weights,
+            recv_topk_ids,
+        )
 
     def combine(
         self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
@@ -1083,8 +1312,12 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         assert isinstance(active, _CeExchange)
         if is_sequence_parallel:
             raise RuntimeError("CE A2A state cannot be combined as sequence parallel")
-        if hidden_states.dtype != torch.float16 or hidden_states.ndim != 2:
-            raise ValueError("CE A2A combine requires a rank-2 FP16 tensor")
+        if (
+            hidden_states.dtype not in (torch.float16, torch.bfloat16)
+            or hidden_states.ndim != 2
+        ):
+            raise ValueError("CE A2A combine requires a rank-2 FP16 or BF16 tensor")
+        wire_hidden_states = _to_ce_wire(hidden_states)
 
         from ce_a2a_moe import (
             quantize_pack_combine_blocks,
@@ -1106,8 +1339,10 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 raise ValueError(
                     "device-proxy expert output does not match fixed row capacity"
                 )
-            hidden_size = int(hidden_states.shape[1])
-            blocks = hidden_states.reshape(self.world_size, block_rows, hidden_size)
+            hidden_size = int(wire_hidden_states.shape[1])
+            blocks = wire_hidden_states.reshape(
+                self.world_size, block_rows, hidden_size
+            )
             if isinstance(active.recv_counts, torch.Tensor):
                 self.last_combine_send_counts = active.recv_counts
                 self.last_combine_recv_counts = active.send_counts
@@ -1191,6 +1426,40 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     )
             with record_function("moe.ce_a2a.combine_transport"):
                 with record_function("moe.ce_a2a.combine_control"):
+                    if self.combine_ladder is not None:
+                        assert self.combine_ladder is not None
+                        narrow_group_bytes = (
+                            self.codec_group_size * self.combine_bits + 7
+                        ) // 8
+                        wide_group_bytes = (
+                            self.codec_group_size * (self.combine_bits + 1) + 7
+                        ) // 8
+                        payload_row_bytes: int | torch.Tensor = (
+                            self.codec_groups * narrow_group_bytes
+                            + self.combine_ladder
+                            * (wide_group_bytes - narrow_group_bytes)
+                        )
+                    else:
+                        payload_row_bytes = _value_row_bytes(
+                            hidden_size,
+                            self.combine_bits or 16,
+                            self.codec_group_size,
+                        )
+                    self._record_wire_bytes(
+                        1,
+                        active.recv_counts,
+                        payload_row_bytes,
+                        payload=True,
+                    )
+                    self._record_wire_bytes(
+                        1,
+                        active.recv_counts,
+                        (
+                            self.combine_send_row_bytes
+                            if self.combine_fill
+                            else self.combine_row_bytes
+                        ),
+                    )
                     self._submit_fixed_exchange(
                         1,
                         blocks,
@@ -1248,19 +1517,30 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     )
             self._active = None
             self.ce_combine_calls += 1
-            return output
+            return _from_ce_wire(output, active.output_dtype)
 
         assert isinstance(active.send_counts, tuple)
         assert isinstance(active.recv_counts, tuple)
         assert active.owner_token_ids is not None
         owner_partials = torch.empty(
-            (sum(active.send_counts), int(hidden_states.shape[1])),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+            (sum(active.send_counts), int(wire_hidden_states.shape[1])),
+            dtype=torch.float16,
+            device=wire_hidden_states.device,
+        )
+        self._record_wire_bytes(
+            1,
+            active.recv_counts,
+            int(wire_hidden_states.shape[1]) * 2,
+        )
+        self._record_wire_bytes(
+            1,
+            active.recv_counts,
+            int(wire_hidden_states.shape[1]) * 2,
+            payload=True,
         )
         with record_function("moe.ce_a2a.combine_transport"):
             self.transport.combine(
-                hidden_states,
+                wire_hidden_states,
                 active.recv_counts,
                 owner_partials,
                 active.send_counts,
@@ -1273,7 +1553,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             )
         self._active = None
         self.ce_combine_calls += 1
-        return output
+        return _from_ce_wire(output, active.output_dtype)
 
     def _report_delta_error(self, hidden_states: torch.Tensor) -> None:
         """Compare what delta actually rebuilt against plain quantization.
@@ -1309,6 +1589,28 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             )
 
     def diagnostics(self) -> dict[str, Any]:
+        device_wire_bytes = (
+            (0, 0)
+            if self._ce_wire_bytes_device is None
+            else tuple(int(value) for value in self._ce_wire_bytes_device.tolist())
+        )
+        actual_dispatch_wire_bytes = (
+            self.ce_dispatch_wire_bytes + device_wire_bytes[0]
+        )
+        actual_combine_wire_bytes = self.ce_combine_wire_bytes + device_wire_bytes[1]
+        device_payload_bytes = (
+            (0, 0)
+            if self._ce_payload_bytes_device is None
+            else tuple(
+                int(value) for value in self._ce_payload_bytes_device.tolist()
+            )
+        )
+        actual_dispatch_payload_bytes = (
+            self.ce_dispatch_payload_bytes + device_payload_bytes[0]
+        )
+        actual_combine_payload_bytes = (
+            self.ce_combine_payload_bytes + device_payload_bytes[1]
+        )
         result: dict[str, Any] = {
             "backend": "ce_a2a",
             "min_global_rows": self.min_global_rows,
@@ -1322,12 +1624,31 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             "dispatch_delta_period": self.delta_period,
             "combine_bits": self.combine_bits or 16,
             "codec_group_size": self.codec_group_size,
+            "codec_groups": self.codec_groups or None,
+            "prefill_only": self.prefill_only,
             "ce_dispatch_calls": self.ce_dispatch_calls,
             "ce_combine_calls": self.ce_combine_calls,
+            "ce_fp16_dispatch_calls": self.ce_fp16_dispatch_calls,
+            "ce_bf16_dispatch_calls": self.ce_bf16_dispatch_calls,
             "nccl_dispatch_calls": self.nccl_dispatch_calls,
             "nccl_combine_calls": self.nccl_combine_calls,
             "capacity_fallbacks": self.capacity_fallbacks,
+            "min_rows_fallbacks": self.min_rows_fallbacks,
             "unsupported_fallbacks": self.unsupported_fallbacks,
+            "policy_fallbacks": dict(self.policy_fallbacks),
+            "phase_dispatch_calls": dict(self.phase_dispatch_calls),
+            "last_dispatch_path": self.last_dispatch_path,
+            "last_fallback_reason": self.last_fallback_reason,
+            "actual_dispatch_wire_bytes": actual_dispatch_wire_bytes,
+            "actual_combine_wire_bytes": actual_combine_wire_bytes,
+            "actual_total_wire_bytes": (
+                actual_dispatch_wire_bytes + actual_combine_wire_bytes
+            ),
+            "actual_dispatch_payload_bytes": actual_dispatch_payload_bytes,
+            "actual_combine_payload_bytes": actual_combine_payload_bytes,
+            "actual_total_payload_bytes": (
+                actual_dispatch_payload_bytes + actual_combine_payload_bytes
+            ),
             "transport_initialized": self.transport is not None,
             # The per-layer schedule keys off this counter, so its alignment is
             # load-bearing: a total that is not a whole number of stacks means
@@ -1386,4 +1707,6 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self.fixed_recv_weights = None
         self.combine_recv_blocks = None
         self.combine_send_blocks = None
+        self._ce_wire_bytes_device = None
+        self._ce_payload_bytes_device = None
         self._active = None

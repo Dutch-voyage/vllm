@@ -214,6 +214,7 @@ if TYPE_CHECKING:
     VLLM_CE_A2A_DISPATCH_BITS: int = 0
     VLLM_CE_A2A_COMBINE_BITS: int = 0
     VLLM_CE_A2A_CODEC_GROUP: int = 128
+    VLLM_CE_A2A_PREFILL_ONLY: bool = False
     VLLM_CE_A2A_COMBINE_FILL: bool = False
     VLLM_CE_A2A_COMBINE_LADDER_G: int = 0
     VLLM_CE_A2A_DELTA_DISPATCH: bool = False
@@ -1604,6 +1605,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_CE_A2A_CODEC_GROUP": lambda: int(
         os.getenv("VLLM_CE_A2A_CODEC_GROUP", "128")
+    ),
+    # Apply CE/PACE only to pure-prefill model forwards. Decode and mixed
+    # prefill/decode batches use the unchanged NCCL AG/RS path.
+    "VLLM_CE_A2A_PREFILL_ONLY": lambda: bool(
+        int(os.getenv("VLLM_CE_A2A_PREFILL_ONLY", "0"))
     ),
     # Give every light combine edge the widest ladder that still fits inside
     # the busiest edge's byte budget. The exchange waits on its slowest edge,
