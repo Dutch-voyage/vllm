@@ -18,6 +18,13 @@ from vllm.model_executor.layers.fused_moe.config import (
     int4_w4a16_moe_quant_config,
     int8_w8a16_moe_quant_config,
 )
+from vllm.model_executor.layers.fused_moe.experts.triton_moe import (
+    TritonExperts,
+)
+from vllm.model_executor.layers.fused_moe.modular_kernel import (
+    FusedMoEExpertsModular,
+    FusedMoEPrepareAndFinalizeModular,
+)
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
@@ -243,6 +250,57 @@ def repeat_and_trim_group_quant_metadata(
     return loaded_weight.narrow(1, 0, target_group_count)
 
 
+class _MoeWNA16ExpertsAdapter(TritonExperts):
+    """Expose the legacy packed WNA16 kernel through the modular interface."""
+
+    def workspace_shapes(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        topk: int,
+        global_num_experts: int,
+        local_num_experts: int,
+        expert_tokens_meta: Any,
+        activation: Any,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+        return (0,), (0,), (M, K)
+
+    def apply(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: Any,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        expert_tokens_meta: Any,
+        apply_router_weight_on_input: bool,
+    ) -> None:
+        from vllm.model_executor.layers.fused_moe import fused_experts
+
+        result = fused_experts(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            quant_config=self.quant_config,
+        )
+        output.copy_(result)
+
+
 class MoeWNA16Method(FusedMoEMethodBase):
     """Linear method for MOE WNA16 (W8A16/W4A16) quantization.
 
@@ -253,6 +311,41 @@ class MoeWNA16Method(FusedMoEMethodBase):
     def __init__(self, quant_config: MoeWNA16Config, moe: "FusedMoEConfig") -> None:
         super().__init__(moe)
         self.quant_config = quant_config
+
+    def maybe_make_prepare_finalize(
+        self,
+        routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    ) -> FusedMoEPrepareAndFinalizeModular | None:
+        from vllm.model_executor.layers.fused_moe.all2all_utils import (
+            maybe_make_prepare_finalize,
+        )
+
+        prepare_finalize = maybe_make_prepare_finalize(
+            self.moe,
+            self.moe_quant_config,
+            routing_tables,
+            allow_new_interface=True,
+        )
+        assert prepare_finalize is None or isinstance(
+            prepare_finalize, FusedMoEPrepareAndFinalizeModular
+        )
+        return prepare_finalize
+
+    def select_gemm_impl(
+        self,
+        prepare_finalize: FusedMoEPrepareAndFinalizeModular,
+        layer: RoutedExperts,
+    ) -> FusedMoEExpertsModular:
+        assert self.moe_quant_config is not None
+        return _MoeWNA16ExpertsAdapter(
+            moe_config=self.moe,
+            quant_config=self.moe_quant_config,
+        )
+
+    def get_modular_moe_weights(
+        self, layer: RoutedExperts
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return layer.w13_qweight, layer.w2_qweight
 
     def create_weights(
         self,

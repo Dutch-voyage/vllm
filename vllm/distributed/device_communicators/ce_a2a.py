@@ -163,7 +163,11 @@ def _attention_phase(attn_metadata: Any) -> str:
 def _forward_phase() -> str:
     if not is_forward_context_available():
         return "unknown"
-    return _attention_phase(get_forward_context().attn_metadata)
+    context = get_forward_context()
+    phase = context.additional_kwargs.get("moe_attention_phase")
+    if phase in ("prefill", "decode", "mixed"):
+        return phase
+    return _attention_phase(context.attn_metadata)
 
 
 def _prefill_policy_fallback_reason(phase: str) -> str | None:

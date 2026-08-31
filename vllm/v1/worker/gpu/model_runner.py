@@ -1335,6 +1335,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 has_lora=self.lora_config is not None,
                 num_active_loras=batch_desc.num_active_loras,
             )
+            prefill_requests = input_batch.is_prefilling_np[: input_batch.num_reqs]
+            if input_batch.num_reqs == 0:
+                moe_attention_phase = "unknown"
+            elif bool(prefill_requests.all()):
+                moe_attention_phase = "prefill"
+            elif bool(prefill_requests.any()):
+                moe_attention_phase = "mixed"
+            else:
+                moe_attention_phase = "decode"
 
             with set_forward_context(
                 attn_metadata,
@@ -1346,6 +1355,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
+                additional_kwargs={"moe_attention_phase": moe_attention_phase},
             ):
                 self.kv_connector.pre_forward(scheduler_output)
                 if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:

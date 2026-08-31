@@ -4,10 +4,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.distributed.device_communicators import ce_a2a as ce_a2a_module
 from vllm.distributed.device_communicators.ce_a2a import (
     CeA2AAll2AllManager,
     _attention_phase,
     _codec_group_count,
+    _forward_phase,
     _from_ce_wire,
     _prefill_policy_fallback_reason,
     _to_ce_wire,
@@ -134,6 +136,32 @@ def test_gptoss_checkpoint_group_is_not_a_valid_codec_group() -> None:
 )
 def test_attention_phase(metadata: object, expected: str) -> None:
     assert _attention_phase(metadata) == expected
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected"),
+    [
+        ("prefill", "prefill"),
+        ("decode", "decode"),
+        ("mixed", "mixed"),
+        (None, "unknown"),
+    ],
+)
+def test_forward_phase_prefers_authoritative_runner_signal(
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str | None,
+    expected: str,
+) -> None:
+    additional_kwargs = (
+        {} if phase is None else {"moe_attention_phase": phase}
+    )
+    context = SimpleNamespace(
+        additional_kwargs=additional_kwargs,
+        attn_metadata=None,
+    )
+    monkeypatch.setattr(ce_a2a_module, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(ce_a2a_module, "get_forward_context", lambda: context)
+    assert _forward_phase() == expected
 
 
 @pytest.mark.parametrize(

@@ -127,6 +127,13 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             "logic. This function should not be called."
         )
 
+    def get_modular_moe_weights(
+        self, layer: "RoutedExperts"
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the two expert weight tensors used by a modular kernel."""
+
+        return layer.w13_weight, layer.w2_weight
+
     @abstractmethod
     def get_fused_moe_quant_config(
         self, layer: "RoutedExperts"

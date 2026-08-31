@@ -4373,6 +4373,19 @@ class GPUModelRunner(
                 num_tokens_unpadded,
                 ubatch_slices_padded,
             )
+        prefill_requests = (
+            self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
+            < self.input_batch.num_prompt_tokens_cpu_tensor[:num_reqs]
+        )
+        if num_reqs == 0:
+            moe_attention_phase = "unknown"
+        elif bool(prefill_requests.all()):
+            moe_attention_phase = "prefill"
+        elif bool(prefill_requests.any()):
+            moe_attention_phase = "mixed"
+        else:
+            moe_attention_phase = "decode"
+
         with (
             set_forward_context(
                 attn_metadata,
@@ -4384,6 +4397,7 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
                 slot_mapping=slot_mappings,
                 skip_compiled=has_encoder_input,
+                additional_kwargs={"moe_attention_phase": moe_attention_phase},
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
