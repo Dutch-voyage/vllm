@@ -11,6 +11,7 @@ from vllm.distributed.device_communicators.ce_a2a import (
     _codec_group_count,
     _forward_phase,
     _from_ce_wire,
+    _ladder_views,
     _pace_policy_name,
     _prefill_policy_fallback_reason,
     _solve_max_edge_dispatch_plan,
@@ -255,6 +256,32 @@ def test_bf16_codec_boundary_restores_compute_dtype() -> None:
     assert wire.dtype == torch.float16
     assert restored.dtype == torch.bfloat16
     torch.testing.assert_close(restored, tensor, rtol=0, atol=0)
+
+
+def test_bf16_compressed_codec_boundary_preserves_exponent_range() -> None:
+    tensor = torch.tensor([[1.0e20, -1.0e20]], dtype=torch.bfloat16)
+    wire = _to_ce_wire(tensor, compressed=True)
+    assert wire.dtype == torch.bfloat16
+    assert wire.data_ptr() == tensor.data_ptr()
+    assert torch.isfinite(wire).all()
+    assert wire.abs().max() > torch.finfo(torch.float16).max
+    assert _from_ce_wire(wire, torch.bfloat16).data_ptr() == tensor.data_ptr()
+
+
+def test_fp16_compressed_codec_boundary_is_byte_identical() -> None:
+    tensor = torch.tensor([[1.0, -2.0]], dtype=torch.float16)
+    before = tensor.view(torch.uint8).clone()
+    wire = _to_ce_wire(tensor, compressed=True)
+    assert wire.data_ptr() == tensor.data_ptr()
+    assert torch.equal(wire.view(torch.uint8), before)
+
+
+def test_ladder_views_selects_bf16_scale_storage() -> None:
+    arena = torch.zeros((2, 3, 12), dtype=torch.uint8)
+    values, scales = _ladder_views(arena, 8, torch.bfloat16)
+    assert values.shape == (2, 36)
+    assert scales.shape == (2, 3, 2)
+    assert scales.dtype == torch.bfloat16
 
 
 def test_wire_accounting_separates_phase_payload_and_self_edge() -> None:

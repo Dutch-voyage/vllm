@@ -170,13 +170,19 @@ def _dispatch_ladder_value_row_bytes(
     return promoted_groups * (group_size // 8) + base
 
 
-def _to_ce_wire(tensor: torch.Tensor) -> torch.Tensor:
-    """Return the FP16 tensor carried by the CE wire codec."""
+def _to_ce_wire(
+    tensor: torch.Tensor, *, compressed: bool = False
+) -> torch.Tensor:
+    """Return the tensor carried by one CE wire leg.
+
+    Raw transport remains FP16 for compatibility. Compressed codecs preserve
+    BF16 so their two-byte group scales retain BF16's exponent range.
+    """
 
     if tensor.dtype == torch.float16:
         return tensor
     if tensor.dtype == torch.bfloat16:
-        return tensor.to(torch.float16)
+        return tensor if compressed else tensor.to(torch.float16)
     raise ValueError("CE A2A supports FP16 or BF16 compute activations")
 
 
@@ -239,7 +245,11 @@ def _prefill_policy_fallback_reason(phase: str) -> str | None:
     raise ValueError(f"unknown CE A2A forward phase: {phase}")
 
 
-def _ladder_views(arena: torch.Tensor, value_bytes: int):
+def _ladder_views(
+    arena: torch.Tensor,
+    value_bytes: int,
+    scale_dtype: torch.dtype = torch.float16,
+):
     """Split one fixed-stride arena into the pair of tensors the ladder wants.
 
     The codec addresses codes by row pitch and scales as ``[world, rows,
@@ -251,7 +261,7 @@ def _ladder_views(arena: torch.Tensor, value_bytes: int):
     world, rows, row_bytes = (int(dim) for dim in arena.shape)
     return (
         arena.view(world, rows * row_bytes),
-        arena[:, :, value_bytes:].view(torch.float16),
+        arena[:, :, value_bytes:].view(scale_dtype),
     )
 
 
@@ -648,6 +658,8 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self.fixed_recv_ids: torch.Tensor | None = None
         self.fixed_recv_weights: torch.Tensor | None = None
         self.dispatch_reference: torch.Tensor | None = None
+        self.dispatch_wire_dtype: torch.dtype | None = None
+        self.combine_wire_dtype: torch.dtype | None = None
         self.combine_recv_blocks: torch.Tensor | None = None
         self.combine_send_blocks: torch.Tensor | None = None
         self.combine_value_bytes = 0
@@ -802,7 +814,9 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             extra_tensors,
         )
 
-    def _ensure_transport(self, hidden_size: int, top_k: int) -> None:
+    def _ensure_transport(
+        self, hidden_size: int, top_k: int, compute_dtype: torch.dtype
+    ) -> None:
         from ce_a2a_moe import (
             CoalescedCeTransport,
             DeviceCountCeScheduler,
@@ -814,6 +828,12 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             lowbit_block_payload_bytes,
         )
 
+        if compute_dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("CE A2A transport requires FP16 or BF16 compute")
+        dispatch_wire_dtype = (
+            compute_dtype if self.dispatch_bits else torch.float16
+        )
+        combine_wire_dtype = compute_dtype if self.combine_bits else torch.float16
         if self.transport is not None:
             assert self.packet_spec is not None
             if (
@@ -821,7 +841,14 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 or self.packet_spec.top_k != top_k
             ):
                 raise ValueError("CE A2A v1 supports one MoE packet shape per model")
+            if (
+                self.dispatch_wire_dtype != dispatch_wire_dtype
+                or self.combine_wire_dtype != combine_wire_dtype
+            ):
+                raise ValueError("CE A2A compute dtype changed after initialization")
             return
+        self.dispatch_wire_dtype = dispatch_wire_dtype
+        self.combine_wire_dtype = combine_wire_dtype
         self.codec_groups = _codec_group_count(hidden_size, self.codec_group_size)
         self.packet_spec = DispatchPacketSpec(
             hidden_size=hidden_size,
@@ -884,6 +911,8 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             builder_options = {}
             if self.delta_max_edge:
                 builder_options["max_activation_bits"] = self.dispatch_bits + 1
+            if builder_type is FusedBlockDispatchBuilder:
+                builder_options["activation_dtype"] = dispatch_wire_dtype
             self.packet_builder = builder_type(
                 spec=self.packet_spec,
                 experts_per_rank=self.experts_per_rank,
@@ -902,7 +931,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 )
                 self.dispatch_reference = torch.zeros(
                     (self.world_size, self.max_edge_rows, hidden_size),
-                    dtype=torch.float16,
+                    dtype=dispatch_wire_dtype,
                     device=torch.cuda.current_device(),
                 )
         self.transport = CoalescedCeTransport(
@@ -952,7 +981,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 )
             self.fixed_recv_hidden = torch.empty(
                 (total_rows, hidden_size),
-                dtype=torch.float16,
+                dtype=dispatch_wire_dtype,
                 device=torch.cuda.current_device(),
             )
             self.fixed_recv_ids = torch.empty(
@@ -1203,9 +1232,11 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         output_dtype = hidden_states.dtype
         hidden_size = int(hidden_states.shape[1])
         top_k = int(topk_ids.shape[1])
-        self._ensure_transport(hidden_size, top_k)
+        self._ensure_transport(hidden_size, top_k, output_dtype)
         assert self.transport is not None and self.packet_spec is not None
-        hidden_states = _to_ce_wire(hidden_states)
+        hidden_states = _to_ce_wire(
+            hidden_states, compressed=bool(self.dispatch_bits)
+        )
         if output_dtype == torch.bfloat16:
             self.ce_bf16_dispatch_calls += 1
         else:
@@ -1551,7 +1582,11 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             or hidden_states.ndim != 2
         ):
             raise ValueError("CE A2A combine requires a rank-2 FP16 or BF16 tensor")
-        wire_hidden_states = _to_ce_wire(hidden_states)
+        wire_hidden_states = _to_ce_wire(
+            hidden_states, compressed=bool(self.combine_bits)
+        )
+        if wire_hidden_states.dtype != self.combine_wire_dtype:
+            raise ValueError("CE A2A combine dtype changed after initialization")
 
         from ce_a2a_moe import (
             quantize_pack_combine_blocks,
@@ -1637,7 +1672,9 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         )
                     else:
                         values, scales = _ladder_views(
-                            self.combine_send_blocks, self.combine_value_bytes
+                            self.combine_send_blocks,
+                            self.combine_value_bytes,
+                            wire_hidden_states.dtype,
                         )
                         quantize_pack_ladder_blocks(
                             blocks,
@@ -1716,12 +1753,15 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         hidden_size=hidden_size,
                         base_bits=self.combine_bits,
                         group_size=self.codec_group_size,
+                        output_dtype=wire_hidden_states.dtype,
                     )
                 elif self.combine_ladder_g:
                     from ce_a2a_moe.ladder import reduce_ladder_owner_partials
 
                     values, scales = _ladder_views(
-                        self.combine_recv_blocks, self.combine_value_bytes
+                        self.combine_recv_blocks,
+                        self.combine_value_bytes,
+                        wire_hidden_states.dtype,
                     )
                     output = reduce_ladder_owner_partials(
                         values,
@@ -1733,6 +1773,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         base_bits=self.combine_bits,
                         group_size=self.codec_group_size,
                         row_pitch=self.combine_row_bytes,
+                        output_dtype=wire_hidden_states.dtype,
                     )
                 elif self.combine_bits:
                     output = reduce_packed_owner_partials(
@@ -1742,6 +1783,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         hidden_size=hidden_size,
                         bits=self.combine_bits,
                         group_size=self.codec_group_size,
+                        output_dtype=wire_hidden_states.dtype,
                     )
                 else:
                     output = reduce_fixed_owner_partials(
