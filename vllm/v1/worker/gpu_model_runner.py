@@ -4378,7 +4378,7 @@ class GPUModelRunner(
             < self.input_batch.num_prompt_tokens_cpu_tensor[:num_reqs]
         )
         if num_reqs == 0:
-            moe_attention_phase = "unknown"
+            moe_attention_phase = "idle"
         elif bool(prefill_requests.all()):
             moe_attention_phase = "prefill"
         elif bool(prefill_requests.any()):

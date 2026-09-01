@@ -14,6 +14,7 @@ from vllm.distributed.device_communicators.ce_a2a import (
     _ladder_views,
     _pace_policy_name,
     _prefill_policy_fallback_reason,
+    _proxy_cpu_for_rank,
     _solve_max_edge_dispatch_plan,
     _to_ce_wire,
     _value_row_bytes,
@@ -35,6 +36,66 @@ def test_gptoss_group64_codec_layout() -> None:
     assert spec.metadata_padding_bytes == 2
     assert spec.packet_bytes == 2284
     assert lowbit_block_payload_bytes(2880, 6, 64) == 2250
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="PACE codec requires CUDA")
+def test_uncompressed_bf16_fused_dispatch_round_trip() -> None:
+    from ce_a2a_moe import (
+        DispatchPacketSpec,
+        FusedBlockDispatchBuilder,
+        unpack_fixed_dispatch_blocks,
+    )
+
+    rows, hidden_size, top_k = 11, 128, 2
+    device = torch.device("cuda:0")
+    generator = torch.Generator(device=device).manual_seed(19)
+    hidden = torch.randn(
+        (rows, hidden_size),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    topk_ids = torch.randint(
+        4,
+        (rows, top_k),
+        dtype=torch.int32,
+        device=device,
+        generator=generator,
+    )
+    topk_weights = torch.rand(
+        (rows, top_k),
+        dtype=torch.float32,
+        device=device,
+        generator=generator,
+    )
+    spec = DispatchPacketSpec(
+        hidden_size=hidden_size,
+        top_k=top_k,
+        activation_bits=16,
+    )
+    builder = FusedBlockDispatchBuilder(
+        spec=spec,
+        experts_per_rank=4,
+        world_size=1,
+        max_edge_rows=rows,
+        device=device,
+        activation_dtype=torch.bfloat16,
+    )
+    built = builder.build(hidden, topk_ids, topk_weights)
+    recv_hidden, recv_ids, recv_weights = unpack_fixed_dispatch_blocks(
+        built.packets,
+        built.send_counts,
+        spec=spec,
+        expert_rank=0,
+        experts_per_rank=4,
+        output_hidden=torch.empty(
+            (rows + 1, hidden_size), dtype=torch.bfloat16, device=device
+        ),
+    )
+
+    torch.testing.assert_close(recv_hidden[:rows], hidden, rtol=0, atol=0)
+    torch.testing.assert_close(recv_ids[:rows], topk_ids, rtol=0, atol=0)
+    torch.testing.assert_close(recv_weights[:rows], topk_weights, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="PACE codec requires CUDA")
@@ -164,8 +225,41 @@ def test_gptoss_plan_uses_exact_aligned_widths() -> None:
     assert all(width % 4 == 0 for width in widths)
 
 
+def test_device_max_edge_plan_matches_reference_without_host_copies() -> None:
+    from ce_a2a_moe.packet import DispatchPacketSpec, dispatch_ladder_packet_bytes
+
+    spec = DispatchPacketSpec(
+        hidden_size=2048,
+        top_k=8,
+        activation_bits=5,
+        group_size=128,
+        carry_token_id=True,
+    )
+    counts = torch.tensor([128, 73, 29, 0], dtype=torch.int32)
+    peak = torch.tensor(128, dtype=torch.int32)
+    expected_groups, expected_widths = _solve_max_edge_dispatch_plan(
+        counts.tolist(), spec, int(peak)
+    )
+    manager = CeA2AAll2AllManager.__new__(CeA2AAll2AllManager)
+    manager.dispatch_floor_row = dispatch_ladder_packet_bytes(spec, 0)
+    manager.dispatch_groups = spec.groups
+    wide_row = dispatch_ladder_packet_bytes(spec, spec.groups)
+    manager.dispatch_ladder_step = (
+        wide_row - manager.dispatch_floor_row
+    ) // manager.dispatch_groups
+    actual_groups = torch.empty_like(counts)
+
+    manager._solve_max_edge_delta(counts, peak, actual_groups)
+    actual_widths = actual_groups * manager.dispatch_ladder_step
+    actual_widths.add_(manager.dispatch_floor_row)
+
+    assert actual_groups.tolist() == expected_groups
+    assert actual_widths.tolist() == expected_widths
+
+
 def test_locked_five_arm_policies_select_distinct_paths() -> None:
     policies = {
+        # Historical policy label; the raw 16-bit path now retains FP16/BF16.
         "fp16": (0, 0, False, False, False),
         "uniform_int6": (6, 6, False, False, False),
         "maxedge_delta_5to6": (5, 6, True, True, False),
@@ -174,6 +268,39 @@ def test_locked_five_arm_policies_select_distinct_paths() -> None:
     }
     selected = {_pace_policy_name(*policy) for policy in policies.values()}
     assert selected == set(policies)
+
+
+def test_proxy_cpu_map_is_topology_aware_unique_and_exact() -> None:
+    mapping = "20,21,22,23,48,49,50,51"
+
+    assert [_proxy_cpu_for_rank(20, rank, 8, mapping) for rank in range(8)] == [
+        20,
+        21,
+        22,
+        23,
+        48,
+        49,
+        50,
+        51,
+    ]
+    assert _proxy_cpu_for_rank(20, 3, 8, "") == 23
+    assert _proxy_cpu_for_rank(-1, 0, 8, "") is None
+    with pytest.raises(ValueError, match="exactly one CPU per rank"):
+        _proxy_cpu_for_rank(20, 0, 8, "20,21")
+    with pytest.raises(ValueError, match="unique and nonnegative"):
+        _proxy_cpu_for_rank(20, 0, 4, "20,20,21,22")
+
+
+def test_ce_observability_environment_is_registered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm import envs
+
+    monkeypatch.setenv("VLLM_CE_A2A_PHASE_TIMING", "1")
+    monkeypatch.setenv("VLLM_CE_A2A_ENQUEUE_ONLY_WAIT", "1")
+
+    assert envs.environment_variables["VLLM_CE_A2A_PHASE_TIMING"]() is True
+    assert envs.environment_variables["VLLM_CE_A2A_ENQUEUE_ONLY_WAIT"]() is True
 
 
 def test_gptoss_checkpoint_group_is_not_a_valid_codec_group() -> None:
@@ -207,7 +334,8 @@ def test_attention_phase(metadata: object, expected: str) -> None:
         ("prefill", "prefill"),
         ("decode", "decode"),
         ("mixed", "mixed"),
-        (None, "unknown"),
+        ("idle", "idle"),
+        (None, "idle"),
     ],
 )
 def test_forward_phase_prefers_authoritative_runner_signal(
@@ -227,11 +355,35 @@ def test_forward_phase_prefers_authoritative_runner_signal(
     assert _forward_phase() == expected
 
 
+def test_forward_phase_classifies_missing_context_as_idle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        ce_a2a_module, "is_forward_context_available", lambda: False
+    )
+
+    assert _forward_phase() == "idle"
+
+
+def test_forward_phase_keeps_malformed_active_context_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = SimpleNamespace(
+        additional_kwargs={},
+        attn_metadata={"layer": SimpleNamespace()},
+    )
+    monkeypatch.setattr(ce_a2a_module, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(ce_a2a_module, "get_forward_context", lambda: context)
+
+    assert _forward_phase() == "unknown"
+
+
 @pytest.mark.parametrize(
     ("phase", "reason"),
     [
         ("prefill", None),
         ("decode", "policy_decode"),
+        ("idle", "policy_idle"),
         ("mixed", "policy_mixed_batch"),
         ("unknown", "policy_unknown"),
     ],
@@ -253,8 +405,10 @@ def test_bf16_codec_boundary_restores_compute_dtype() -> None:
     tensor = torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16)
     wire = _to_ce_wire(tensor)
     restored = _from_ce_wire(wire, torch.bfloat16)
-    assert wire.dtype == torch.float16
+    assert wire.dtype == torch.bfloat16
+    assert wire.data_ptr() == tensor.data_ptr()
     assert restored.dtype == torch.bfloat16
+    assert restored.data_ptr() == tensor.data_ptr()
     torch.testing.assert_close(restored, tensor, rtol=0, atol=0)
 
 
@@ -292,8 +446,14 @@ def test_wire_accounting_separates_phase_payload_and_self_edge() -> None:
     manager.ce_combine_wire_bytes = 0
     manager.ce_dispatch_payload_bytes = 0
     manager.ce_combine_payload_bytes = 0
+    manager.ce_dispatch_packets = 0
+    manager.ce_combine_packets = 0
+    manager.ce_dispatch_messages = 0
+    manager.ce_combine_messages = 0
     manager._ce_wire_bytes_device = torch.zeros(2, dtype=torch.int64)
     manager._ce_payload_bytes_device = torch.zeros(2, dtype=torch.int64)
+    manager._ce_packet_counts_device = torch.zeros(2, dtype=torch.int64)
+    manager._ce_message_counts_device = torch.zeros(2, dtype=torch.int64)
 
     counts = torch.tensor([3, 4, 5, 6], dtype=torch.int32)
     widths = torch.tensor([10, 20, 30, 40], dtype=torch.int32)
@@ -304,5 +464,9 @@ def test_wire_accounting_separates_phase_payload_and_self_edge() -> None:
 
     assert manager._ce_wire_bytes_device.tolist() == [140, 0]
     assert manager._ce_payload_bytes_device.tolist() == [420, 0]
+    assert manager._ce_packet_counts_device.tolist() == [14, 0]
+    assert manager._ce_message_counts_device.tolist() == [3, 0]
     assert manager.ce_combine_wire_bytes == 77
     assert manager.ce_combine_payload_bytes == 340
+    assert manager.ce_combine_packets == 11
+    assert manager.ce_combine_messages == 3

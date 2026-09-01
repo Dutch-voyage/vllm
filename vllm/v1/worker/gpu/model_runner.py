@@ -1337,7 +1337,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             prefill_requests = input_batch.is_prefilling_np[: input_batch.num_reqs]
             if input_batch.num_reqs == 0:
-                moe_attention_phase = "unknown"
+                moe_attention_phase = "idle"
             elif bool(prefill_requests.all()):
                 moe_attention_phase = "prefill"
             elif bool(prefill_requests.any()):
