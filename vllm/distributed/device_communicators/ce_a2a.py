@@ -1270,9 +1270,14 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         recv_counts: torch.Tensor,
         send_row_bytes: torch.Tensor | None = None,
         recv_row_bytes: torch.Tensor | None = None,
+        geometry_stage: Any | None = None,
     ) -> None:
         assert self.control is not None
         if self.control_kind == "graph_proxy":
+            if geometry_stage is not None:
+                raise RuntimeError(
+                    "eager geometry staging cannot be used with graph control"
+                )
             assert self._control_handle is not None
             torch.ops.vllm.ce_a2a_exchange_(
                 send,
@@ -1283,6 +1288,13 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 phase,
             )
             return
+        submit_options = {}
+        if geometry_stage is not None:
+            if self.control_kind != "native_proxy":
+                raise RuntimeError(
+                    "early geometry staging requires native proxy control"
+                )
+            submit_options["geometry_stage"] = geometry_stage
         if send_row_bytes is None:
             self.control.submit(
                 "dispatch" if phase == 0 else "combine",
@@ -1290,6 +1302,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 send_counts,
                 recv,
                 recv_counts,
+                **submit_options,
             )
             return
         # Only controls with a per-edge width ABI may carry adaptive packets.
@@ -1307,6 +1320,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             recv_counts,
             send_row_bytes,
             recv_row_bytes,
+            **submit_options,
         )
 
     def dispatch_router_logits(
@@ -1556,6 +1570,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         )
             dispatch_send_row_bytes = None
             dispatch_recv_row_bytes = None
+            dispatch_geometry_stage = None
             if self.delta_max_edge:
                 assert self.dispatch_peak is not None
                 assert self.dispatch_ladder is not None
@@ -1586,6 +1601,17 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         out=self.dispatch_recv_row_bytes,
                     )
                     self.dispatch_recv_row_bytes.add_(self.dispatch_floor_row)
+                dispatch_send_row_bytes = self.dispatch_send_row_bytes
+                dispatch_recv_row_bytes = self.dispatch_recv_row_bytes
+                if self.control_kind == "native_proxy":
+                    assert self.control is not None
+                    dispatch_geometry_stage = self.control.begin_geometry_stage(
+                        "dispatch",
+                        coalesced.send_counts,
+                        recv_counts_device,
+                        dispatch_send_row_bytes,
+                        dispatch_recv_row_bytes,
+                    )
                 with self._timed_phase("dispatch_pack"):
                     coalesced = self.packet_builder.pack_prepared_ladder(
                         hidden_states,
@@ -1597,8 +1623,6 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     self._report_delta_error(hidden_states)
                 self.last_dispatch_send_counts = coalesced.send_counts
                 self.last_dispatch_recv_counts = recv_counts_device
-                dispatch_send_row_bytes = self.dispatch_send_row_bytes
-                dispatch_recv_row_bytes = self.dispatch_recv_row_bytes
                 account_counts = coalesced.send_counts.to(torch.int64).clone()
                 account_counts[self.rank] = 0
                 assert self._dispatch_effective_inputs_device is not None
@@ -1646,6 +1670,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         recv_counts_device,
                         dispatch_send_row_bytes,
                         dispatch_recv_row_bytes,
+                        geometry_stage=dispatch_geometry_stage,
                     )
                 send_counts = coalesced.send_counts
                 recv_counts = recv_counts_device
@@ -1823,9 +1848,16 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             blocks = wire_hidden_states.reshape(
                 self.world_size, block_rows, hidden_size
             )
+            combine_geometry_stage = None
             if isinstance(active.recv_counts, torch.Tensor):
                 self.last_combine_send_counts = active.recv_counts
                 self.last_combine_recv_counts = active.send_counts
+            if self.control_kind == "native_proxy" and not self.combine_fill:
+                combine_geometry_stage = self.control.begin_geometry_stage(
+                    "combine",
+                    active.recv_counts,
+                    active.send_counts,
+                )
             if self.combine_ladder_g:
                 assert self.combine_send_blocks is not None
                 from ce_a2a_moe.ladder import quantize_pack_ladder_blocks
@@ -1868,6 +1900,14 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                             self.combine_ladder_recv * self.combine_ladder_step,
                             self.combine_floor_row,
                             out=self.combine_recv_row_bytes,
+                        )
+                    if self.control_kind == "native_proxy":
+                        combine_geometry_stage = self.control.begin_geometry_stage(
+                            "combine",
+                            active.recv_counts,
+                            active.send_counts,
+                            self.combine_send_row_bytes,
+                            self.combine_recv_row_bytes,
                         )
                 with (
                     self._timed_phase("combine_pack"),
@@ -1962,6 +2002,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         active.send_counts,
                         self.combine_send_row_bytes if self.combine_fill else None,
                         self.combine_recv_row_bytes if self.combine_fill else None,
+                        geometry_stage=combine_geometry_stage,
                     )
             with (
                 self._timed_phase("owner_reduce"),
