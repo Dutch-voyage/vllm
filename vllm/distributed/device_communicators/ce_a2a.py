@@ -1051,13 +1051,22 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     dtype=dispatch_wire_dtype,
                     device=torch.cuda.current_device(),
                 )
+        direct_inbox_receive = self.control_kind == "native_proxy"
         self.transport = CoalescedCeTransport(
-            max_edge_rows=self.max_edge_rows,
+            # The packet ABI reserves one sentinel row. With a compact
+            # symmetric-inbox stride, that inbox is also the contiguous fixed
+            # receive tensor and the proxy need not submit eight copy-outs.
+            max_edge_rows=(
+                self.max_edge_rows + 1
+                if direct_inbox_receive
+                else self.max_edge_rows
+            ),
             dispatch_row_bytes=self.dispatch_row_bytes,
             hidden_size=hidden_size,
             combine_row_bytes=self.combine_row_bytes,
             scheduler=self.scheduler,
             process_group=self.device_group,
+            compact_block_stride=direct_inbox_receive,
         )
         self._ce_wire_bytes_device = torch.zeros(
             2,
@@ -1096,11 +1105,21 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     device=torch.cuda.current_device(),
                 )
                 self.fill_count_recv = torch.empty_like(self.fill_count_send)
-            self.dispatch_recv_blocks = torch.empty(
-                (self.world_size, block_rows, self.dispatch_row_bytes),
-                dtype=torch.uint8,
-                device=torch.cuda.current_device(),
+            self.dispatch_recv_blocks = (
+                self.transport._inbox_view(
+                    self.transport.dispatch_inbox,
+                    dtype=torch.uint8,
+                    row_elements=self.dispatch_row_bytes,
+                ).local
+                if direct_inbox_receive
+                else torch.empty(
+                    (self.world_size, block_rows, self.dispatch_row_bytes),
+                    dtype=torch.uint8,
+                    device=torch.cuda.current_device(),
+                )
             )
+            if direct_inbox_receive and not self.dispatch_recv_blocks.is_contiguous():
+                raise RuntimeError("direct dispatch inbox must be contiguous")
             if self.delta_max_edge:
                 self.dispatch_ladder = torch.zeros_like(self.recv_counts_device)
                 self.dispatch_ladder_recv = torch.zeros_like(
@@ -1136,7 +1155,20 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     dtype=torch.uint8,
                     device=torch.cuda.current_device(),
                 )
-                self.combine_recv_blocks = torch.empty_like(self.combine_send_blocks)
+                self.combine_recv_blocks = (
+                    self.transport._inbox_view(
+                        self.transport.combine_inbox,
+                        dtype=torch.uint8,
+                        row_elements=self.combine_row_bytes,
+                    ).local
+                    if direct_inbox_receive
+                    else torch.empty_like(self.combine_send_blocks)
+                )
+                if (
+                    direct_inbox_receive
+                    and not self.combine_recv_blocks.is_contiguous()
+                ):
+                    raise RuntimeError("direct combine inbox must be contiguous")
                 if self.combine_ladder_g:
                     # Uniform across destinations, so the kernels still take a
                     # per-destination vector but every entry is the same and the
@@ -1176,11 +1208,24 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         ) - _group_bytes(self.codec_group_size, self.combine_bits)
                         self.combine_groups = hidden_size // self.codec_group_size
             else:
-                self.combine_recv_blocks = torch.empty(
-                    (self.world_size, block_rows, hidden_size),
-                    dtype=combine_wire_dtype,
-                    device=torch.cuda.current_device(),
+                self.combine_recv_blocks = (
+                    self.transport._inbox_view(
+                        self.transport.combine_inbox,
+                        dtype=combine_wire_dtype,
+                        row_elements=hidden_size,
+                    ).local
+                    if direct_inbox_receive
+                    else torch.empty(
+                        (self.world_size, block_rows, hidden_size),
+                        dtype=combine_wire_dtype,
+                        device=torch.cuda.current_device(),
+                    )
                 )
+                if (
+                    direct_inbox_receive
+                    and not self.combine_recv_blocks.is_contiguous()
+                ):
+                    raise RuntimeError("direct combine inbox must be contiguous")
             proxy_cpu_base = envs.VLLM_CE_A2A_PROXY_CPU
             proxy_cpu = _proxy_cpu_for_rank(
                 proxy_cpu_base,
