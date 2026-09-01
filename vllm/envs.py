@@ -1583,7 +1583,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_CE_A2A_CONTROL": env_with_choices(
         "VLLM_CE_A2A_CONTROL",
         "host_sync",
-        ["host_sync", "device_proxy", "native_proxy", "graph_proxy"],
+        [
+            "host_sync",
+            "device_proxy",
+            "native_proxy",
+            "graph_proxy",
+            "exact_nccl",
+        ],
     ),
     "VLLM_CE_A2A_CONTROL_RING_DEPTH": lambda: int(
         os.getenv("VLLM_CE_A2A_CONTROL_RING_DEPTH", "128")

@@ -500,10 +500,11 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             "device_proxy",
             "native_proxy",
             "graph_proxy",
+            "exact_nccl",
         ):
             raise ValueError(
                 "VLLM_CE_A2A_CONTROL must be host_sync, device_proxy, or "
-                "native_proxy, or graph_proxy"
+                "native_proxy, graph_proxy, or exact_nccl"
             )
         if (
             self.control_kind != "host_sync"
@@ -573,9 +574,13 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             raise ValueError("DELTA_MAX_EDGE builds on delta dispatch")
         if self.delta_max_edge and self.dispatch_bits != 5:
             raise ValueError("DELTA_MAX_EDGE implements the locked INT5-to-INT6 arm")
-        if self.delta_max_edge and self.control_kind != "native_proxy":
+        if self.delta_max_edge and self.control_kind not in (
+            "native_proxy",
+            "exact_nccl",
+        ):
             raise ValueError(
-                "DELTA_MAX_EDGE uses per-edge row widths and needs native_proxy"
+                "DELTA_MAX_EDGE uses per-edge row widths and needs native_proxy "
+                "or exact_nccl"
             )
         self.delta_probe = bool(
             int(os.environ.get("VLLM_CE_A2A_DELTA_PROBE", "0") or 0)
@@ -931,6 +936,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             CoalescedCeTransport,
             DeviceCountCeScheduler,
             DispatchPacketSpec,
+            ExactNcclPacketScheduler,
             FixedBlockDispatchBuilder,
             FusedBlockDispatchBuilder,
             GraphP2PA2AScheduler,
@@ -1235,6 +1241,10 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             )
             if self.control_kind == "graph_proxy":
                 self.control = GraphP2PA2AScheduler(self.transport)
+            elif self.control_kind == "exact_nccl":
+                self.control = ExactNcclPacketScheduler(
+                    process_group=self.device_group
+                )
             else:
                 control_type = (
                     NativeDeviceCountCeScheduler
@@ -1282,11 +1292,11 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 recv_counts,
             )
             return
-        # Only the native proxy carries per-edge widths; the other controls
-        # would silently send the arena pitch and corrupt every narrow edge.
-        if self.control_kind != "native_proxy":
+        # Only controls with a per-edge width ABI may carry adaptive packets.
+        if self.control_kind not in ("native_proxy", "exact_nccl"):
             raise RuntimeError(
-                f"variable-width PACE needs VLLM_CE_A2A_CONTROL=native_proxy, "
+                "variable-width PACE needs VLLM_CE_A2A_CONTROL=native_proxy "
+                f"or exact_nccl, "
                 f"got {self.control_kind}"
             )
         self.control.submit(
