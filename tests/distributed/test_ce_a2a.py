@@ -39,7 +39,7 @@ def test_gptoss_group64_codec_layout() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="PACE codec requires CUDA")
-def test_uncompressed_bf16_fused_dispatch_round_trip() -> None:
+def test_uncompressed_bf16_compute_uses_fp16_wire_round_trip() -> None:
     from ce_a2a_moe import (
         DispatchPacketSpec,
         FusedBlockDispatchBuilder,
@@ -73,15 +73,15 @@ def test_uncompressed_bf16_fused_dispatch_round_trip() -> None:
         top_k=top_k,
         activation_bits=16,
     )
+    wire_hidden = _to_ce_wire(hidden)
     builder = FusedBlockDispatchBuilder(
         spec=spec,
         experts_per_rank=4,
         world_size=1,
         max_edge_rows=rows,
         device=device,
-        activation_dtype=torch.bfloat16,
     )
-    built = builder.build(hidden, topk_ids, topk_weights)
+    built = builder.build(wire_hidden, topk_ids, topk_weights)
     recv_hidden, recv_ids, recv_weights = unpack_fixed_dispatch_blocks(
         built.packets,
         built.send_counts,
@@ -89,11 +89,12 @@ def test_uncompressed_bf16_fused_dispatch_round_trip() -> None:
         expert_rank=0,
         experts_per_rank=4,
         output_hidden=torch.empty(
-            (rows + 1, hidden_size), dtype=torch.bfloat16, device=device
+            (rows + 1, hidden_size), dtype=torch.float16, device=device
         ),
     )
 
-    torch.testing.assert_close(recv_hidden[:rows], hidden, rtol=0, atol=0)
+    restored = _from_ce_wire(recv_hidden[:rows], torch.bfloat16)
+    torch.testing.assert_close(restored, hidden, rtol=0, atol=0)
     torch.testing.assert_close(recv_ids[:rows], topk_ids, rtol=0, atol=0)
     torch.testing.assert_close(recv_weights[:rows], topk_weights, rtol=0, atol=0)
 
@@ -412,10 +413,10 @@ def test_bf16_codec_boundary_restores_compute_dtype() -> None:
     tensor = torch.tensor([[1.0, -2.0]], dtype=torch.bfloat16)
     wire = _to_ce_wire(tensor)
     restored = _from_ce_wire(wire, torch.bfloat16)
-    assert wire.dtype == torch.bfloat16
-    assert wire.data_ptr() == tensor.data_ptr()
+    assert wire.dtype == torch.float16
+    assert wire.data_ptr() != tensor.data_ptr()
     assert restored.dtype == torch.bfloat16
-    assert restored.data_ptr() == tensor.data_ptr()
+    assert restored.data_ptr() != wire.data_ptr()
     torch.testing.assert_close(restored, tensor, rtol=0, atol=0)
 
 
