@@ -708,20 +708,24 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         if self.width_balance:
             if not self.prefill_only:
                 raise ValueError("width balance is currently restricted to prefill only")
-            if self.world_size != 8:
-                raise ValueError("width balance currently requires EP8")
+            if self.world_size not in (4, 8):
+                raise ValueError("width balance currently supports EP4 or EP8")
             if self.packet_builder_kind != "fused":
                 raise ValueError("width balance requires the fused packet builder")
             if self.control_kind != "native_proxy":
                 raise ValueError("width balance requires native_proxy control")
             if self.scheduler != "edge_stream_memops":
                 raise ValueError("width balance requires edge_stream_memops")
-            if self.edge_schedule != "ep8_dual_numa_phase_balanced_v1":
+            expected_schedule = (
+                "cyclic"
+                if self.world_size == 4
+                else "ep8_dual_numa_phase_balanced_v1"
+            )
+            if self.edge_schedule != expected_schedule:
                 raise ValueError(
-                    "width balance requires the fixed phase-balanced EP8 schedule"
+                    f"width balance at EP{self.world_size} requires "
+                    f"the {expected_schedule!r} edge schedule"
                 )
-            if not self.delta_dispatch:
-                raise ValueError("width-balanced dispatch preserves the delta method")
             if self.dispatch_bits != self.width_balance_min_bits:
                 raise ValueError("DISPATCH_BITS must equal WIDTH_BALANCE_MIN_BITS")
             if self.combine_bits != self.width_balance_min_bits:
@@ -739,8 +743,9 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             self.combine_fill,
         )
         if self.width_balance:
+            dispatch_mode = "delta" if self.delta_dispatch else "direct"
             self.pace_policy = (
-                f"balanced_delta_{self.width_balance_min_bits}to"
+                f"balanced_{dispatch_mode}_{self.width_balance_min_bits}to"
                 f"{self.width_balance_max_bits}"
             )
         # Layers run in a fixed order, so counting entries into dispatch -- both
@@ -767,6 +772,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self.dispatch_recv_blocks: torch.Tensor | None = None
         self.dispatch_row_bytes = 0
         self.dispatch_floor_row = 0
+        self.dispatch_target_row_bytes = 0
         self.dispatch_ladder_step = 0
         self.dispatch_groups = 0
         self.dispatch_peak: torch.Tensor | None = None
@@ -1068,9 +1074,17 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     top_k=top_k,
                     activation_bits=6,
                     group_size=self.codec_group_size,
+                    carry_token_id=False,
+                )
+                self.dispatch_target_row_bytes = baseline_spec.packet_bytes
+                representation_baseline_spec = _DispatchPacketSpec(
+                    hidden_size=hidden_size,
+                    top_k=top_k,
+                    activation_bits=6,
+                    group_size=self.codec_group_size,
                     carry_token_id=self.delta_dispatch,
                 )
-                self.dispatch_floor_row = baseline_spec.packet_bytes
+                self.dispatch_floor_row = representation_baseline_spec.packet_bytes
                 self.dispatch_row_bytes = dispatch_multirung_packet_bytes(
                     self.packet_spec,
                     self.width_balance_max_bits * self.dispatch_groups,
@@ -1824,6 +1838,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     solve_multirung_widths_device(
                         global_count_matrix,
                         baseline_row_bytes=self.dispatch_floor_row,
+                        target_row_bytes=self.dispatch_target_row_bytes,
                         hidden_size=hidden_size,
                         group_size=self.codec_group_size,
                         baseline_bits=6,
@@ -1885,7 +1900,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         topk_weights,
                         dispatch_ladder,
                     )
-                if self.delta_probe:
+                if self.delta_probe and self.delta_dispatch:
                     self._report_delta_error(hidden_states)
                 self.last_dispatch_send_counts = coalesced.send_counts
                 self.last_dispatch_recv_counts = recv_counts_device
@@ -2032,7 +2047,6 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     from ce_a2a_moe import unpack_multirung_dispatch_blocks
 
                     assert self.dispatch_width_quanta is not None
-                    assert self.dispatch_reference is not None
                     recv_hidden, recv_topk_ids, recv_topk_weights = (
                         unpack_multirung_dispatch_blocks(
                             self.dispatch_recv_blocks,
@@ -2677,6 +2691,16 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             ),
             "width_balance_max_bits": (
                 self.width_balance_max_bits if self.width_balance else None
+            ),
+            "width_balance_dispatch_mode": (
+                None
+                if not self.width_balance
+                else "delta"
+                if self.delta_dispatch
+                else "direct"
+            ),
+            "width_balance_dispatch_target_row_bytes": (
+                self.dispatch_target_row_bytes if self.width_balance else None
             ),
             "dispatch_width_accounting": (
                 None
