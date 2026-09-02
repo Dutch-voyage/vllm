@@ -451,6 +451,7 @@ class _CeExchange:
     local_rows: int
     fixed_control: bool = False
     output_dtype: torch.dtype = torch.float16
+    global_count_matrix: torch.Tensor | None = None
 
 
 class CeA2AAll2AllManager(All2AllManagerBase):
@@ -535,6 +536,22 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 "VLLM_CE_A2A_SCHEDULER must be edge_credits, "
                 "edge_stream_memops, or cyclic_barrier"
             )
+        self.edge_schedule = envs.VLLM_CE_A2A_EDGE_SCHEDULE
+        if self.edge_schedule != "cyclic":
+            if self.edge_schedule != "ep8_dual_numa_adaptive_v1":
+                raise ValueError(
+                    f"unsupported CE edge schedule {self.edge_schedule!r}"
+                )
+            if self.world_size != 8:
+                raise ValueError("adaptive dual-NUMA scheduling requires EP8")
+            if self.control_kind != "native_proxy":
+                raise ValueError(
+                    "adaptive edge scheduling requires native_proxy control"
+                )
+            if self.scheduler != "edge_stream_memops":
+                raise ValueError(
+                    "adaptive edge scheduling requires edge_stream_memops"
+                )
 
         # Experiment-only knobs, read straight from the environment so the
         # sweep does not need a config surface it will never ship with.
@@ -682,6 +699,8 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self.control: Any | None = None
         self._control_handle: int | None = None
         self.recv_counts_device: torch.Tensor | None = None
+        self.global_count_matrix: torch.Tensor | None = None
+        self.global_count_matrix_flat: torch.Tensor | None = None
         self.fill_count_send: torch.Tensor | None = None
         self.fill_count_recv: torch.Tensor | None = None
         self.dispatch_recv_blocks: torch.Tensor | None = None
@@ -1101,6 +1120,15 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 dtype=torch.int32,
                 device=torch.cuda.current_device(),
             )
+            if self.edge_schedule == "ep8_dual_numa_adaptive_v1":
+                self.global_count_matrix_flat = torch.empty(
+                    self.world_size * self.world_size,
+                    dtype=torch.int32,
+                    device=torch.cuda.current_device(),
+                )
+                self.global_count_matrix = self.global_count_matrix_flat.view(
+                    self.world_size, self.world_size
+                )
             if self.combine_fill or self.delta_max_edge:
                 # Carry the source-local peak beside every count. One exact
                 # all-to-all then reconstructs both destination counts and the
@@ -1251,11 +1279,42 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     if self.control_kind == "native_proxy"
                     else DeviceCountCeScheduler
                 )
+                schedule_options = {}
+                if self.edge_schedule == "ep8_dual_numa_adaptive_v1":
+                    from ce_a2a_moe.schedule import edge_schedule_banks
+
+                    dispatch_bank, combine_bank = edge_schedule_banks(
+                        self.edge_schedule, self.world_size
+                    )
+                    schedule_options = {
+                        "dispatch_edge_schedule_bank": dispatch_bank,
+                        "combine_edge_schedule_bank": combine_bank,
+                        "adaptive_schedule_numa_split": self.world_size // 2,
+                        "adaptive_dispatch_width_model": (
+                            (
+                                self.dispatch_floor_row,
+                                self.dispatch_ladder_step,
+                                self.dispatch_groups,
+                            )
+                            if self.delta_max_edge
+                            else None
+                        ),
+                        "adaptive_combine_width_model": (
+                            (
+                                self.combine_floor_row,
+                                self.combine_ladder_step,
+                                self.combine_groups,
+                            )
+                            if self.combine_fill
+                            else None
+                        ),
+                    }
                 self.control = control_type(
                     self.transport,
                     ring_depth=envs.VLLM_CE_A2A_CONTROL_RING_DEPTH,
                     submission_window=envs.VLLM_CE_A2A_PROXY_WINDOW,
                     proxy_cpu=proxy_cpu,
+                    **schedule_options,
                 )
             if self.control_kind == "graph_proxy":
                 self._control_handle = id(self.control)
@@ -1271,12 +1330,18 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         send_row_bytes: torch.Tensor | None = None,
         recv_row_bytes: torch.Tensor | None = None,
         geometry_stage: Any | None = None,
+        global_count_matrix: torch.Tensor | None = None,
+        global_count_matrix_transposed: bool = False,
     ) -> None:
         assert self.control is not None
         if self.control_kind == "graph_proxy":
             if geometry_stage is not None:
                 raise RuntimeError(
                     "eager geometry staging cannot be used with graph control"
+                )
+            if global_count_matrix is not None:
+                raise RuntimeError(
+                    "adaptive edge scheduling is unavailable with graph control"
                 )
             assert self._control_handle is not None
             torch.ops.vllm.ce_a2a_exchange_(
@@ -1295,6 +1360,15 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     "early geometry staging requires native proxy control"
                 )
             submit_options["geometry_stage"] = geometry_stage
+        if global_count_matrix is not None:
+            if self.control_kind != "native_proxy":
+                raise RuntimeError(
+                    "adaptive edge scheduling requires native proxy control"
+                )
+            submit_options["global_count_matrix"] = global_count_matrix
+            submit_options["global_count_matrix_transposed"] = (
+                global_count_matrix_transposed
+            )
         if send_row_bytes is None:
             self.control.submit(
                 "dispatch" if phase == 0 else "combine",
@@ -1536,12 +1610,30 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 else torch.empty_like(coalesced.send_counts)
             )
             assert recv_counts_device is not None
+            global_count_matrix = None
             if self.control_kind != "graph_proxy":
                 with (
                     self._timed_phase("count_collective"),
                     record_function("moe.ce_a2a.count_exchange_gpu"),
                 ):
-                    if self.combine_fill or self.delta_max_edge:
+                    if self.global_count_matrix is not None:
+                        assert self.global_count_matrix_flat is not None
+                        dist.all_gather_into_tensor(
+                            self.global_count_matrix_flat,
+                            coalesced.send_counts,
+                            group=self.device_group,
+                        )
+                        global_count_matrix = self.global_count_matrix
+                        recv_counts_device.copy_(
+                            global_count_matrix[:, self.rank]
+                        )
+                        if self.combine_fill or self.delta_max_edge:
+                            peak = global_count_matrix.max()
+                            if self.combine_fill:
+                                self.combine_peak = peak
+                            if self.delta_max_edge:
+                                self.dispatch_peak = peak
+                    elif self.combine_fill or self.delta_max_edge:
                         assert self.fill_count_send is not None
                         assert self.fill_count_recv is not None
                         local_peak = coalesced.send_counts.max()
@@ -1568,6 +1660,16 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                             coalesced.send_counts,
                             group=self.device_group,
                         )
+            dispatch_control_send_counts = (
+                global_count_matrix[self.rank]
+                if global_count_matrix is not None
+                else coalesced.send_counts
+            )
+            dispatch_control_recv_counts = (
+                global_count_matrix[:, self.rank]
+                if global_count_matrix is not None
+                else recv_counts_device
+            )
             dispatch_send_row_bytes = None
             dispatch_recv_row_bytes = None
             dispatch_geometry_stage = None
@@ -1607,10 +1709,11 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     assert self.control is not None
                     dispatch_geometry_stage = self.control.begin_geometry_stage(
                         "dispatch",
-                        coalesced.send_counts,
-                        recv_counts_device,
+                        dispatch_control_send_counts,
+                        dispatch_control_recv_counts,
                         dispatch_send_row_bytes,
                         dispatch_recv_row_bytes,
+                        global_count_matrix,
                     )
                 with self._timed_phase("dispatch_pack"):
                     coalesced = self.packet_builder.pack_prepared_ladder(
@@ -1665,12 +1768,13 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     self._submit_fixed_exchange(
                         0,
                         coalesced.packets,
-                        coalesced.send_counts,
+                        dispatch_control_send_counts,
                         self.dispatch_recv_blocks,
-                        recv_counts_device,
+                        dispatch_control_recv_counts,
                         dispatch_send_row_bytes,
                         dispatch_recv_row_bytes,
                         geometry_stage=dispatch_geometry_stage,
+                        global_count_matrix=global_count_matrix,
                     )
                 send_counts = coalesced.send_counts
                 recv_counts = recv_counts_device
@@ -1742,6 +1846,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 local_rows=int(hidden_states.shape[0]),
                 fixed_control=True,
                 output_dtype=output_dtype,
+                global_count_matrix=global_count_matrix,
             )
             self.ce_dispatch_calls += 1
             return (
@@ -1848,6 +1953,16 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             blocks = wire_hidden_states.reshape(
                 self.world_size, block_rows, hidden_size
             )
+            combine_control_send_counts = (
+                active.global_count_matrix[:, self.rank]
+                if active.global_count_matrix is not None
+                else active.recv_counts
+            )
+            combine_control_recv_counts = (
+                active.global_count_matrix[self.rank]
+                if active.global_count_matrix is not None
+                else active.send_counts
+            )
             combine_geometry_stage = None
             if isinstance(active.recv_counts, torch.Tensor):
                 self.last_combine_send_counts = active.recv_counts
@@ -1855,8 +1970,12 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             if self.control_kind == "native_proxy" and not self.combine_fill:
                 combine_geometry_stage = self.control.begin_geometry_stage(
                     "combine",
-                    active.recv_counts,
-                    active.send_counts,
+                    combine_control_send_counts,
+                    combine_control_recv_counts,
+                    global_count_matrix=active.global_count_matrix,
+                    global_count_matrix_transposed=(
+                        active.global_count_matrix is not None
+                    ),
                 )
             if self.combine_ladder_g:
                 assert self.combine_send_blocks is not None
@@ -1904,10 +2023,14 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     if self.control_kind == "native_proxy":
                         combine_geometry_stage = self.control.begin_geometry_stage(
                             "combine",
-                            active.recv_counts,
-                            active.send_counts,
+                            combine_control_send_counts,
+                            combine_control_recv_counts,
                             self.combine_send_row_bytes,
                             self.combine_recv_row_bytes,
+                            global_count_matrix=active.global_count_matrix,
+                            global_count_matrix_transposed=(
+                                active.global_count_matrix is not None
+                            ),
                         )
                 with (
                     self._timed_phase("combine_pack"),
@@ -1997,12 +2120,16 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     self._submit_fixed_exchange(
                         1,
                         blocks,
-                        active.recv_counts,
+                        combine_control_send_counts,
                         self.combine_recv_blocks,
-                        active.send_counts,
+                        combine_control_recv_counts,
                         self.combine_send_row_bytes if self.combine_fill else None,
                         self.combine_recv_row_bytes if self.combine_fill else None,
                         geometry_stage=combine_geometry_stage,
+                        global_count_matrix=active.global_count_matrix,
+                        global_count_matrix_transposed=(
+                            active.global_count_matrix is not None
+                        ),
                     )
             with (
                 self._timed_phase("owner_reduce"),
@@ -2217,6 +2344,12 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             "max_edge_rows": self.max_edge_rows,
             "packet_builder": self.packet_builder_kind,
             "control": self.control_kind,
+            "edge_schedule": self.edge_schedule,
+            "count_collective": (
+                "all_gather_global_matrix"
+                if self.edge_schedule == "ep8_dual_numa_adaptive_v1"
+                else "all_to_all_columns"
+            ),
             "dispatch_bits": self.dispatch_bits or 16,
             "dispatch_delta": self.delta_dispatch,
             "dispatch_delta_max_edge": self.delta_max_edge,
@@ -2390,6 +2523,8 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self.recv_counts_device = None
         self.fill_count_send = None
         self.fill_count_recv = None
+        self.global_count_matrix = None
+        self.global_count_matrix_flat = None
         self.dispatch_recv_blocks = None
         self.fixed_recv_hidden = None
         self.fixed_recv_ids = None

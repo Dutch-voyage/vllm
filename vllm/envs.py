@@ -214,6 +214,10 @@ if TYPE_CHECKING:
         "edge_stream_memops",
         "cyclic_barrier",
     ] = "edge_credits"
+    VLLM_CE_A2A_EDGE_SCHEDULE: Literal[
+        "cyclic",
+        "ep8_dual_numa_adaptive_v1",
+    ] = "cyclic"
     VLLM_CE_A2A_DISPATCH_BITS: int = 0
     VLLM_CE_A2A_COMBINE_BITS: int = 0
     VLLM_CE_A2A_CODEC_GROUP: int = 128
@@ -1613,6 +1617,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_CE_A2A_SCHEDULER",
         "edge_credits",
         ["edge_credits", "edge_stream_memops", "cyclic_barrier"],
+    ),
+    "VLLM_CE_A2A_EDGE_SCHEDULE": env_with_choices(
+        "VLLM_CE_A2A_EDGE_SCHEDULE",
+        "cyclic",
+        ["cyclic", "ep8_dual_numa_adaptive_v1"],
     ),
     # Activation width on each CE leg, where 0 keeps the FP16 wire. Only the
     # payload is narrowed; route metadata and scales stay exact.
