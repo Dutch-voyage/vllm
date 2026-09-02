@@ -94,8 +94,10 @@ def _codec_bits(name: str, value: int) -> int:
     """Return a supported activation width, where zero means uncompressed."""
 
     value = int(value)
-    if value and value not in (4, 5, 6, 8):
-        raise ValueError(f"{name} must be 0 (FP16) or one of 4, 5, 6, 8; got {value}")
+    if value and value not in (4, 5, 6, 7, 8):
+        raise ValueError(
+            f"{name} must be 0 (FP16) or one of 4, 5, 6, 7, 8; got {value}"
+        )
     return value
 
 
@@ -522,6 +524,25 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             "VLLM_CE_A2A_CODEC_GROUP", envs.VLLM_CE_A2A_CODEC_GROUP
         )
         self.prefill_only = envs.VLLM_CE_A2A_PREFILL_ONLY
+        self.width_balance_min_bits = int(
+            envs.VLLM_CE_A2A_WIDTH_BALANCE_MIN_BITS
+        )
+        self.width_balance_max_bits = int(
+            envs.VLLM_CE_A2A_WIDTH_BALANCE_MAX_BITS
+        )
+        self.width_balance = bool(
+            self.width_balance_min_bits or self.width_balance_max_bits
+        )
+        if self.width_balance and not (
+            4
+            <= self.width_balance_min_bits
+            <= 6
+            <= self.width_balance_max_bits
+            <= 8
+        ):
+            raise ValueError(
+                "width balance must satisfy 4 <= MIN_BITS <= 6 <= MAX_BITS <= 8"
+            )
         if (self.dispatch_bits or self.combine_bits) and (
             self.packet_builder_kind != "fused"
         ):
@@ -538,7 +559,10 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             )
         self.edge_schedule = envs.VLLM_CE_A2A_EDGE_SCHEDULE
         if self.edge_schedule != "cyclic":
-            if self.edge_schedule != "ep8_dual_numa_adaptive_v1":
+            if self.edge_schedule not in (
+                "ep8_dual_numa_phase_balanced_v1",
+                "ep8_dual_numa_adaptive_v1",
+            ):
                 raise ValueError(
                     f"unsupported CE edge schedule {self.edge_schedule!r}"
                 )
@@ -546,11 +570,11 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 raise ValueError("adaptive dual-NUMA scheduling requires EP8")
             if self.control_kind != "native_proxy":
                 raise ValueError(
-                    "adaptive edge scheduling requires native_proxy control"
+                    "topology edge scheduling requires native_proxy control"
                 )
             if self.scheduler != "edge_stream_memops":
                 raise ValueError(
-                    "adaptive edge scheduling requires edge_stream_memops"
+                    "topology edge scheduling requires edge_stream_memops"
                 )
 
         # Experiment-only knobs, read straight from the environment so the
@@ -681,6 +705,32 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             not self.combine_bits
         ):
             raise ValueError("the combine ladder needs a base width in COMBINE_BITS")
+        if self.width_balance:
+            if not self.prefill_only:
+                raise ValueError("width balance is currently restricted to prefill only")
+            if self.world_size != 8:
+                raise ValueError("width balance currently requires EP8")
+            if self.packet_builder_kind != "fused":
+                raise ValueError("width balance requires the fused packet builder")
+            if self.control_kind != "native_proxy":
+                raise ValueError("width balance requires native_proxy control")
+            if self.scheduler != "edge_stream_memops":
+                raise ValueError("width balance requires edge_stream_memops")
+            if self.edge_schedule != "ep8_dual_numa_phase_balanced_v1":
+                raise ValueError(
+                    "width balance requires the fixed phase-balanced EP8 schedule"
+                )
+            if not self.delta_dispatch:
+                raise ValueError("width-balanced dispatch preserves the delta method")
+            if self.dispatch_bits != self.width_balance_min_bits:
+                raise ValueError("DISPATCH_BITS must equal WIDTH_BALANCE_MIN_BITS")
+            if self.combine_bits != self.width_balance_min_bits:
+                raise ValueError("COMBINE_BITS must equal WIDTH_BALANCE_MIN_BITS")
+            if self.delta_max_edge or self.combine_fill:
+                raise ValueError(
+                    "width balance is a distinct arm; disable DELTA_MAX_EDGE and "
+                    "COMBINE_FILL"
+                )
         self.pace_policy = _pace_policy_name(
             self.dispatch_bits,
             self.combine_bits,
@@ -688,6 +738,11 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             self.delta_max_edge,
             self.combine_fill,
         )
+        if self.width_balance:
+            self.pace_policy = (
+                f"balanced_delta_{self.width_balance_min_bits}to"
+                f"{self.width_balance_max_bits}"
+            )
         # Layers run in a fixed order, so counting entries into dispatch -- both
         # the admitted ones and the ones that fall back -- recovers the index.
         self.layer_calls = 0
@@ -701,6 +756,12 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self.recv_counts_device: torch.Tensor | None = None
         self.global_count_matrix: torch.Tensor | None = None
         self.global_count_matrix_flat: torch.Tensor | None = None
+        self.dispatch_width_quanta: torch.Tensor | None = None
+        self.dispatch_width_row_bytes: torch.Tensor | None = None
+        self.dispatch_width_accounting: torch.Tensor | None = None
+        self.combine_width_quanta: torch.Tensor | None = None
+        self.combine_width_row_bytes: torch.Tensor | None = None
+        self.combine_width_accounting: torch.Tensor | None = None
         self.fill_count_send: torch.Tensor | None = None
         self.fill_count_recv: torch.Tensor | None = None
         self.dispatch_recv_blocks: torch.Tensor | None = None
@@ -993,19 +1054,38 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             carry_token_id=self.delta_dispatch,
         )
         self.dispatch_row_bytes = self.packet_spec.packet_bytes
-        if self.delta_max_edge:
-            from ce_a2a_moe.packet import dispatch_ladder_packet_bytes
+        if self.delta_max_edge or self.width_balance:
+            from ce_a2a_moe.packet import (
+                DispatchPacketSpec as _DispatchPacketSpec,
+                dispatch_ladder_packet_bytes,
+                dispatch_multirung_packet_bytes,
+            )
 
-            self.dispatch_floor_row = dispatch_ladder_packet_bytes(
-                self.packet_spec, 0
-            )
             self.dispatch_groups = self.packet_spec.groups
-            self.dispatch_row_bytes = dispatch_ladder_packet_bytes(
-                self.packet_spec, self.dispatch_groups
-            )
-            self.dispatch_ladder_step = (
-                self.dispatch_row_bytes - self.dispatch_floor_row
-            ) // self.dispatch_groups
+            if self.width_balance:
+                baseline_spec = _DispatchPacketSpec(
+                    hidden_size=hidden_size,
+                    top_k=top_k,
+                    activation_bits=6,
+                    group_size=self.codec_group_size,
+                    carry_token_id=self.delta_dispatch,
+                )
+                self.dispatch_floor_row = baseline_spec.packet_bytes
+                self.dispatch_row_bytes = dispatch_multirung_packet_bytes(
+                    self.packet_spec,
+                    self.width_balance_max_bits * self.dispatch_groups,
+                    maximum_bits=self.width_balance_max_bits,
+                )
+            else:
+                self.dispatch_floor_row = dispatch_ladder_packet_bytes(
+                    self.packet_spec, 0
+                )
+                self.dispatch_row_bytes = dispatch_ladder_packet_bytes(
+                    self.packet_spec, self.dispatch_groups
+                )
+                self.dispatch_ladder_step = (
+                    self.dispatch_row_bytes - self.dispatch_floor_row
+                ) // self.dispatch_groups
         if self.combine_layer_period or self.combine_fill:
             # Sized for the wide rail, since some layers use it and the arena is
             # allocated once. The narrow layers therefore save no bytes here;
@@ -1019,7 +1099,20 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             # length in the native proxy's ABI; until then the widths are real and
             # the accuracy they buy is measurable, but the peak is conservative.
             self.combine_ladder_g = hidden_size // self.codec_group_size
-        if self.combine_ladder_g:
+        if self.width_balance:
+            from ce_a2a_moe.ladder import multirung_row_bytes
+
+            self.combine_floor_row = lowbit_block_payload_bytes(
+                hidden_size, 6, self.codec_group_size
+            )
+            self.combine_row_bytes = multirung_row_bytes(
+                hidden_size,
+                self.width_balance_max_bits * self.codec_groups,
+                self.codec_group_size,
+                minimum_bits=self.width_balance_min_bits,
+                maximum_bits=self.width_balance_max_bits,
+            )
+        elif self.combine_ladder_g:
             from ce_a2a_moe.ladder import ladder_row_bytes, ladder_value_bytes
 
             self.combine_value_bytes = ladder_value_bytes(
@@ -1047,8 +1140,10 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 else FixedBlockDispatchBuilder
             )
             builder_options = {}
-            if self.delta_max_edge:
+            if self.delta_max_edge or self.width_balance:
                 builder_options["max_activation_bits"] = self.dispatch_bits + 1
+            if self.width_balance:
+                builder_options["max_activation_bits"] = self.width_balance_max_bits
             if builder_type is FusedBlockDispatchBuilder:
                 builder_options["activation_dtype"] = dispatch_wire_dtype
             elif dispatch_wire_dtype != torch.float16:
@@ -1120,7 +1215,10 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 dtype=torch.int32,
                 device=torch.cuda.current_device(),
             )
-            if self.edge_schedule == "ep8_dual_numa_adaptive_v1":
+            if (
+                self.edge_schedule == "ep8_dual_numa_adaptive_v1"
+                or self.width_balance
+            ):
                 self.global_count_matrix_flat = torch.empty(
                     self.world_size * self.world_size,
                     dtype=torch.int32,
@@ -1129,6 +1227,41 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 self.global_count_matrix = self.global_count_matrix_flat.view(
                     self.world_size, self.world_size
                 )
+            if self.width_balance:
+                matrix_shape = (self.world_size, self.world_size)
+                self.dispatch_width_quanta = torch.empty(
+                    matrix_shape, dtype=torch.int32, device=torch.cuda.current_device()
+                )
+                self.dispatch_width_row_bytes = torch.empty_like(
+                    self.dispatch_width_quanta
+                )
+                self.dispatch_width_accounting = torch.empty(
+                    4, dtype=torch.int64, device=torch.cuda.current_device()
+                )
+                self.combine_width_quanta = torch.empty_like(
+                    self.dispatch_width_quanta
+                )
+                self.combine_width_row_bytes = torch.empty_like(
+                    self.dispatch_width_quanta
+                )
+                self.combine_width_accounting = torch.empty_like(
+                    self.dispatch_width_accounting
+                )
+                # Materialize the row/column views once.  Geometry staging
+                # deliberately verifies tensor identity, and recreating an
+                # equivalent view at submit time is not the same reservation.
+                self.dispatch_send_row_bytes = self.dispatch_width_row_bytes[
+                    self.rank
+                ]
+                self.dispatch_recv_row_bytes = self.dispatch_width_row_bytes[
+                    :, self.rank
+                ]
+                self.combine_send_row_bytes = self.combine_width_row_bytes[
+                    self.rank
+                ]
+                self.combine_recv_row_bytes = self.combine_width_row_bytes[
+                    :, self.rank
+                ]
             if self.combine_fill or self.delta_max_edge:
                 # Carry the source-local peak beside every count. One exact
                 # all-to-all then reconstructs both destination counts and the
@@ -1308,6 +1441,16 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                             if self.combine_fill
                             else None
                         ),
+                    }
+                elif self.edge_schedule == "ep8_dual_numa_phase_balanced_v1":
+                    from ce_a2a_moe.schedule import edge_schedules
+
+                    dispatch_schedule, combine_schedule = edge_schedules(
+                        self.edge_schedule, self.world_size
+                    )
+                    schedule_options = {
+                        "dispatch_edge_schedule": dispatch_schedule,
+                        "combine_edge_schedule": combine_schedule,
                     }
                 self.control = control_type(
                     self.transport,
@@ -1571,7 +1714,9 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 self.dispatch_reference.zero_()
 
         dispatch_build_phase = (
-            "dispatch_layout" if self.delta_max_edge else "dispatch_pack"
+            "dispatch_layout"
+            if self.delta_max_edge or self.width_balance
+            else "dispatch_pack"
         )
         with (
             self._timed_phase(dispatch_build_phase),
@@ -1579,7 +1724,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         ):
             if self.packet_builder_kind in ("fixed", "fused"):
                 assert self.packet_builder is not None
-                if self.delta_max_edge:
+                if self.delta_max_edge or self.width_balance:
                     coalesced = self.packet_builder.prepare(
                         hidden_states, topk_ids, topk_weights
                     )
@@ -1589,7 +1734,12 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         topk_ids,
                         topk_weights,
                     )
-                if self.delta_probe and self.delta_dispatch and not self.delta_max_edge:
+                if (
+                    self.delta_probe
+                    and self.delta_dispatch
+                    and not self.delta_max_edge
+                    and not self.width_balance
+                ):
                     self._report_delta_error(hidden_states)
             else:
                 coalesced = build_dispatch_packets(
@@ -1660,6 +1810,42 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                             coalesced.send_counts,
                             group=self.device_group,
                         )
+            if self.width_balance:
+                assert global_count_matrix is not None
+                assert self.dispatch_width_quanta is not None
+                assert self.dispatch_width_row_bytes is not None
+                assert self.dispatch_width_accounting is not None
+                assert self.combine_width_quanta is not None
+                assert self.combine_width_row_bytes is not None
+                assert self.combine_width_accounting is not None
+                from ce_a2a_moe import solve_multirung_widths_device
+
+                with self._timed_phase("width_balance_plan"):
+                    solve_multirung_widths_device(
+                        global_count_matrix,
+                        baseline_row_bytes=self.dispatch_floor_row,
+                        hidden_size=hidden_size,
+                        group_size=self.codec_group_size,
+                        baseline_bits=6,
+                        minimum_bits=self.width_balance_min_bits,
+                        maximum_bits=self.width_balance_max_bits,
+                        bit_quanta=self.dispatch_width_quanta,
+                        row_bytes=self.dispatch_width_row_bytes,
+                        accounting=self.dispatch_width_accounting,
+                    )
+                    solve_multirung_widths_device(
+                        global_count_matrix,
+                        baseline_row_bytes=self.combine_floor_row,
+                        hidden_size=hidden_size,
+                        group_size=self.codec_group_size,
+                        baseline_bits=6,
+                        minimum_bits=self.width_balance_min_bits,
+                        maximum_bits=self.width_balance_max_bits,
+                        bit_quanta=self.combine_width_quanta,
+                        row_bytes=self.combine_width_row_bytes,
+                        accounting=self.combine_width_accounting,
+                        transposed=True,
+                    )
             dispatch_control_send_counts = (
                 global_count_matrix[self.rank]
                 if global_count_matrix is not None
@@ -1673,7 +1859,37 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             dispatch_send_row_bytes = None
             dispatch_recv_row_bytes = None
             dispatch_geometry_stage = None
-            if self.delta_max_edge:
+            if self.width_balance:
+                assert self.dispatch_width_quanta is not None
+                assert self.dispatch_width_row_bytes is not None
+                assert self.packet_builder is not None
+                dispatch_ladder = self.dispatch_width_quanta[self.rank]
+                dispatch_ladder_recv = self.dispatch_width_quanta[:, self.rank]
+                assert self.dispatch_send_row_bytes is not None
+                assert self.dispatch_recv_row_bytes is not None
+                dispatch_send_row_bytes = self.dispatch_send_row_bytes
+                dispatch_recv_row_bytes = self.dispatch_recv_row_bytes
+                if self.control_kind == "native_proxy":
+                    assert self.control is not None
+                    dispatch_geometry_stage = self.control.begin_geometry_stage(
+                        "dispatch",
+                        dispatch_control_send_counts,
+                        dispatch_control_recv_counts,
+                        dispatch_send_row_bytes,
+                        dispatch_recv_row_bytes,
+                    )
+                with self._timed_phase("dispatch_pack"):
+                    coalesced = self.packet_builder.pack_prepared_multirung(
+                        hidden_states,
+                        topk_ids,
+                        topk_weights,
+                        dispatch_ladder,
+                    )
+                if self.delta_probe:
+                    self._report_delta_error(hidden_states)
+                self.last_dispatch_send_counts = coalesced.send_counts
+                self.last_dispatch_recv_counts = recv_counts_device
+            elif self.delta_max_edge:
                 assert self.dispatch_peak is not None
                 assert self.dispatch_ladder is not None
                 assert self.dispatch_ladder_recv is not None
@@ -1741,7 +1957,10 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 else self.packet_spec.packet_bytes
             )
             payload_row_bytes = (
-                _dispatch_ladder_value_row_bytes(
+                self.dispatch_width_quanta[self.rank]
+                * (self.codec_group_size // 8)
+                if self.width_balance
+                else _dispatch_ladder_value_row_bytes(
                     hidden_size,
                     self.dispatch_bits,
                     self.codec_group_size,
@@ -1774,7 +1993,11 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         dispatch_send_row_bytes,
                         dispatch_recv_row_bytes,
                         geometry_stage=dispatch_geometry_stage,
-                        global_count_matrix=global_count_matrix,
+                        global_count_matrix=(
+                            global_count_matrix
+                            if self.edge_schedule == "ep8_dual_numa_adaptive_v1"
+                            else None
+                        ),
                     )
                 send_counts = coalesced.send_counts
                 recv_counts = recv_counts_device
@@ -1805,7 +2028,27 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 self._timed_phase("dispatch_unpack"),
                 record_function("moe.ce_a2a.unpack"),
             ):
-                if self.delta_max_edge:
+                if self.width_balance:
+                    from ce_a2a_moe import unpack_multirung_dispatch_blocks
+
+                    assert self.dispatch_width_quanta is not None
+                    assert self.dispatch_reference is not None
+                    recv_hidden, recv_topk_ids, recv_topk_weights = (
+                        unpack_multirung_dispatch_blocks(
+                            self.dispatch_recv_blocks,
+                            recv_counts_device,
+                            self.dispatch_width_quanta[:, self.rank],
+                            spec=self.packet_spec,
+                            maximum_bits=self.width_balance_max_bits,
+                            expert_rank=self.rank,
+                            experts_per_rank=self.experts_per_rank,
+                            output_hidden=self.fixed_recv_hidden,
+                            output_ids=self.fixed_recv_ids,
+                            output_weights=self.fixed_recv_weights,
+                            reference=self.dispatch_reference,
+                        )
+                    )
+                elif self.delta_max_edge:
                     from ce_a2a_moe import unpack_ladder_dispatch_blocks
 
                     assert self.dispatch_ladder_recv is not None
@@ -1964,10 +2207,16 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 else active.send_counts
             )
             combine_geometry_stage = None
+            combine_width_send_row_bytes = None
+            combine_width_recv_row_bytes = None
             if isinstance(active.recv_counts, torch.Tensor):
                 self.last_combine_send_counts = active.recv_counts
                 self.last_combine_recv_counts = active.send_counts
-            if self.control_kind == "native_proxy" and not self.combine_fill:
+            if (
+                self.control_kind == "native_proxy"
+                and not self.combine_fill
+                and not self.width_balance
+            ):
                 combine_geometry_stage = self.control.begin_geometry_stage(
                     "combine",
                     combine_control_send_counts,
@@ -1977,7 +2226,40 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         active.global_count_matrix is not None
                     ),
                 )
-            if self.combine_ladder_g:
+            if self.width_balance:
+                assert self.combine_send_blocks is not None
+                assert self.combine_width_quanta is not None
+                assert self.combine_width_row_bytes is not None
+                combine_ladder = self.combine_width_quanta[self.rank]
+                combine_ladder_recv = self.combine_width_quanta[:, self.rank]
+                assert self.combine_send_row_bytes is not None
+                assert self.combine_recv_row_bytes is not None
+                combine_width_send_row_bytes = self.combine_send_row_bytes
+                combine_width_recv_row_bytes = self.combine_recv_row_bytes
+                if self.control_kind == "native_proxy":
+                    combine_geometry_stage = self.control.begin_geometry_stage(
+                        "combine",
+                        combine_control_send_counts,
+                        combine_control_recv_counts,
+                        combine_width_send_row_bytes,
+                        combine_width_recv_row_bytes,
+                    )
+                from ce_a2a_moe.ladder import quantize_pack_multirung_inline
+
+                with (
+                    self._timed_phase("combine_pack"),
+                    record_function("moe.ce_a2a.combine_pack"),
+                ):
+                    quantize_pack_multirung_inline(
+                        blocks,
+                        self.combine_send_blocks,
+                        combine_ladder,
+                        minimum_bits=self.width_balance_min_bits,
+                        maximum_bits=self.width_balance_max_bits,
+                        group_size=self.codec_group_size,
+                    )
+                blocks = self.combine_send_blocks
+            elif self.combine_ladder_g:
                 assert self.combine_send_blocks is not None
                 from ce_a2a_moe.ladder import quantize_pack_ladder_blocks
 
@@ -2083,7 +2365,13 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     self._timed_phase("combine_control"),
                     record_function("moe.ce_a2a.combine_control"),
                 ):
-                    if self.combine_ladder is not None:
+                    if self.width_balance:
+                        assert self.combine_width_quanta is not None
+                        payload_row_bytes = (
+                            self.combine_width_quanta[self.rank]
+                            * (self.codec_group_size // 8)
+                        )
+                    elif self.combine_ladder is not None:
                         assert self.combine_ladder is not None
                         narrow_group_bytes = (
                             self.codec_group_size * self.combine_bits + 7
@@ -2114,6 +2402,8 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         (
                             self.combine_send_row_bytes
                             if self.combine_fill
+                            else self.combine_width_row_bytes[self.rank]
+                            if self.width_balance
                             else self.combine_row_bytes
                         ),
                     )
@@ -2123,19 +2413,47 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         combine_control_send_counts,
                         self.combine_recv_blocks,
                         combine_control_recv_counts,
-                        self.combine_send_row_bytes if self.combine_fill else None,
-                        self.combine_recv_row_bytes if self.combine_fill else None,
+                        self.combine_send_row_bytes
+                        if self.combine_fill
+                        else combine_width_send_row_bytes
+                        if self.width_balance
+                        else None,
+                        self.combine_recv_row_bytes
+                        if self.combine_fill
+                        else combine_width_recv_row_bytes
+                        if self.width_balance
+                        else None,
                         geometry_stage=combine_geometry_stage,
-                        global_count_matrix=active.global_count_matrix,
+                        global_count_matrix=(
+                            active.global_count_matrix
+                            if self.edge_schedule == "ep8_dual_numa_adaptive_v1"
+                            else None
+                        ),
                         global_count_matrix_transposed=(
-                            active.global_count_matrix is not None
+                            self.edge_schedule == "ep8_dual_numa_adaptive_v1"
                         ),
                     )
             with (
                 self._timed_phase("owner_reduce"),
                 record_function("moe.ce_a2a.owner_reduce"),
             ):
-                if self.combine_fill:
+                if self.width_balance:
+                    from ce_a2a_moe.ladder import reduce_multirung_inline
+
+                    assert self.combine_width_quanta is not None
+                    output = reduce_multirung_inline(
+                        self.combine_recv_blocks,
+                        self.combine_width_quanta[:, self.rank],
+                        active.token_positions,
+                        block_rows=block_rows,
+                        local_rows=active.local_rows,
+                        hidden_size=hidden_size,
+                        minimum_bits=self.width_balance_min_bits,
+                        maximum_bits=self.width_balance_max_bits,
+                        group_size=self.codec_group_size,
+                        output_dtype=active.output_dtype,
+                    )
+                elif self.combine_fill:
                     from ce_a2a_moe.ladder import reduce_ladder_inline
 
                     output = reduce_ladder_inline(
@@ -2347,8 +2665,28 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             "edge_schedule": self.edge_schedule,
             "count_collective": (
                 "all_gather_global_matrix"
-                if self.edge_schedule == "ep8_dual_numa_adaptive_v1"
+                if (
+                    self.edge_schedule == "ep8_dual_numa_adaptive_v1"
+                    or self.width_balance
+                )
                 else "all_to_all_columns"
+            ),
+            "width_balance": self.width_balance,
+            "width_balance_min_bits": (
+                self.width_balance_min_bits if self.width_balance else None
+            ),
+            "width_balance_max_bits": (
+                self.width_balance_max_bits if self.width_balance else None
+            ),
+            "dispatch_width_accounting": (
+                None
+                if self.dispatch_width_accounting is None
+                else [int(v) for v in self.dispatch_width_accounting.tolist()]
+            ),
+            "combine_width_accounting": (
+                None
+                if self.combine_width_accounting is None
+                else [int(v) for v in self.combine_width_accounting.tolist()]
             ),
             "dispatch_bits": self.dispatch_bits or 16,
             "dispatch_delta": self.delta_dispatch,
@@ -2525,6 +2863,12 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self.fill_count_recv = None
         self.global_count_matrix = None
         self.global_count_matrix_flat = None
+        self.dispatch_width_quanta = None
+        self.dispatch_width_row_bytes = None
+        self.dispatch_width_accounting = None
+        self.combine_width_quanta = None
+        self.combine_width_row_bytes = None
+        self.combine_width_accounting = None
         self.dispatch_recv_blocks = None
         self.fixed_recv_hidden = None
         self.fixed_recv_ids = None
@@ -2538,6 +2882,8 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self.dispatch_ladder_recv = None
         self.dispatch_send_row_bytes = None
         self.dispatch_recv_row_bytes = None
+        self.combine_send_row_bytes = None
+        self.combine_recv_row_bytes = None
         self.last_dispatch_send_counts = None
         self.last_dispatch_recv_counts = None
         self._dispatch_effective_inputs_device = None

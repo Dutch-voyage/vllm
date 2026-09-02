@@ -216,12 +216,15 @@ if TYPE_CHECKING:
     ] = "edge_credits"
     VLLM_CE_A2A_EDGE_SCHEDULE: Literal[
         "cyclic",
+        "ep8_dual_numa_phase_balanced_v1",
         "ep8_dual_numa_adaptive_v1",
     ] = "cyclic"
     VLLM_CE_A2A_DISPATCH_BITS: int = 0
     VLLM_CE_A2A_COMBINE_BITS: int = 0
     VLLM_CE_A2A_CODEC_GROUP: int = 128
     VLLM_CE_A2A_PREFILL_ONLY: bool = False
+    VLLM_CE_A2A_WIDTH_BALANCE_MIN_BITS: int = 0
+    VLLM_CE_A2A_WIDTH_BALANCE_MAX_BITS: int = 0
     VLLM_CE_A2A_COMBINE_FILL: bool = False
     VLLM_CE_A2A_COMBINE_LADDER_G: int = 0
     VLLM_CE_A2A_DELTA_DISPATCH: bool = False
@@ -1621,7 +1624,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_CE_A2A_EDGE_SCHEDULE": env_with_choices(
         "VLLM_CE_A2A_EDGE_SCHEDULE",
         "cyclic",
-        ["cyclic", "ep8_dual_numa_adaptive_v1"],
+        [
+            "cyclic",
+            "ep8_dual_numa_phase_balanced_v1",
+            "ep8_dual_numa_adaptive_v1",
+        ],
     ),
     # Activation width on each CE leg, where 0 keeps the FP16 wire. Only the
     # payload is narrowed; route metadata and scales stay exact.
@@ -1638,6 +1645,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prefill/decode batches use the unchanged NCCL AG/RS path.
     "VLLM_CE_A2A_PREFILL_ONLY": lambda: bool(
         int(os.getenv("VLLM_CE_A2A_PREFILL_ONLY", "0"))
+    ),
+    # Experimental exact-byte water-fill. Zero disables it. When enabled both
+    # communication legs use widths in [MIN, MAX] with the exact uniform-INT6
+    # global byte budget; decode remains on the unmodified path via PREFILL_ONLY.
+    "VLLM_CE_A2A_WIDTH_BALANCE_MIN_BITS": lambda: int(
+        os.getenv("VLLM_CE_A2A_WIDTH_BALANCE_MIN_BITS", "0")
+    ),
+    "VLLM_CE_A2A_WIDTH_BALANCE_MAX_BITS": lambda: int(
+        os.getenv("VLLM_CE_A2A_WIDTH_BALANCE_MAX_BITS", "0")
     ),
     # Give every light combine edge the widest ladder that still fits inside
     # the busiest edge's byte budget. The exchange waits on its slowest edge,
