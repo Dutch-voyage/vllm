@@ -227,6 +227,8 @@ if TYPE_CHECKING:
     VLLM_CE_A2A_PREFILL_ONLY: bool = False
     VLLM_CE_A2A_WIDTH_BALANCE_MIN_BITS: int = 0
     VLLM_CE_A2A_WIDTH_BALANCE_MAX_BITS: int = 0
+    VLLM_CE_A2A_CODEC_SNAPSHOT_PREFIX: str = ""
+    VLLM_CE_A2A_CODEC_SNAPSHOT_CALL: int = 47
     VLLM_CE_A2A_COMBINE_FILL: bool = False
     VLLM_CE_A2A_COMBINE_LADDER_G: int = 0
     VLLM_CE_A2A_DELTA_DISPATCH: bool = False
@@ -1662,6 +1664,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_CE_A2A_WIDTH_BALANCE_MAX_BITS": lambda: int(
         os.getenv("VLLM_CE_A2A_WIDTH_BALANCE_MAX_BITS", "0")
+    ),
+    "VLLM_CE_A2A_CODEC_SNAPSHOT_PREFIX": lambda: os.getenv(
+        "VLLM_CE_A2A_CODEC_SNAPSHOT_PREFIX", ""
+    ),
+    "VLLM_CE_A2A_CODEC_SNAPSHOT_CALL": lambda: int(
+        os.getenv("VLLM_CE_A2A_CODEC_SNAPSHOT_CALL", "47")
     ),
     # Give every light combine edge the widest ladder that still fits inside
     # the busiest edge's byte budget. The exchange waits on its slowest edge,

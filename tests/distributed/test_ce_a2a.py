@@ -377,6 +377,8 @@ def test_ce_observability_environment_is_registered(
     monkeypatch.setenv(
         "VLLM_CE_A2A_EDGE_SCHEDULE", "ep8_dual_numa_adaptive_v1"
     )
+    monkeypatch.setenv("VLLM_CE_A2A_CODEC_SNAPSHOT_PREFIX", "/tmp/frozen")
+    monkeypatch.setenv("VLLM_CE_A2A_CODEC_SNAPSHOT_CALL", "47")
 
     assert envs.environment_variables["VLLM_CE_A2A_PHASE_TIMING"]() is True
     assert envs.environment_variables["VLLM_CE_A2A_ENQUEUE_ONLY_WAIT"]() is True
@@ -388,6 +390,11 @@ def test_ce_observability_environment_is_registered(
         envs.environment_variables["VLLM_CE_A2A_EDGE_SCHEDULE"]()
         == "ep8_dual_numa_adaptive_v1"
     )
+    assert (
+        envs.environment_variables["VLLM_CE_A2A_CODEC_SNAPSHOT_PREFIX"]()
+        == "/tmp/frozen"
+    )
+    assert envs.environment_variables["VLLM_CE_A2A_CODEC_SNAPSHOT_CALL"]() == 47
 
 
 def test_gptoss_checkpoint_group_is_not_a_valid_codec_group() -> None:
