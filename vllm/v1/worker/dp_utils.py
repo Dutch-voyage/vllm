@@ -14,6 +14,13 @@ from vllm.v1.worker.ubatch_utils import (
 
 logger = init_logger(__name__)
 
+_MOE_PHASE_CODES = {
+    "idle": 1,
+    "decode": 2,
+    "mixed": 3,
+    "prefill": 4,
+}
+
 
 def _get_device_and_group(parallel_config: ParallelConfig):
     # Use the actual device assigned to the DP group, not just the device type
@@ -39,16 +46,19 @@ def _run_ar(
     padded_num_tokens_per_ubatch: int,
     cudagraph_mode: int,
     parallel_config: ParallelConfig,
+    moe_attention_phase: str | None = None,
 ) -> torch.Tensor:
     dp_size = parallel_config.data_parallel_size
     dp_rank = parallel_config.data_parallel_rank
     device, group = _get_device_and_group(parallel_config)
     # Populate this rank's contribution on CPU to reduce GPU syncs.
-    tensor_cpu = torch.zeros(4, dp_size, dtype=torch.int32)
+    tensor_cpu = torch.zeros(5, dp_size, dtype=torch.int32)
     tensor_cpu[0][dp_rank] = orig_num_tokens_per_ubatch
     tensor_cpu[1][dp_rank] = padded_num_tokens_per_ubatch
     tensor_cpu[2][dp_rank] = 1 if should_ubatch else 0
     tensor_cpu[3][dp_rank] = cudagraph_mode
+    if moe_attention_phase is not None:
+        tensor_cpu[4][dp_rank] = _MOE_PHASE_CODES[moe_attention_phase]
     tensor = tensor_cpu.to(device, non_blocking=True)
     dist.all_reduce(tensor, group=group)
     return tensor
@@ -98,13 +108,25 @@ def _post_process_cudagraph_mode(tensor: torch.Tensor) -> int:
     return int(tensor[3, :].min().item())
 
 
+def _post_process_moe_attention_phase(
+    tensor: torch.Tensor, phase: str | None
+) -> str | None:
+    if phase is None:
+        return None
+    phase_codes = {int(value) for value in tensor[4, :].cpu().tolist()}
+    if 0 in phase_codes:
+        raise RuntimeError("data-parallel MoE phase synchronization was incomplete")
+    return phase if len(phase_codes) == 1 else "mixed"
+
+
 def _synchronize_dp_ranks(
     num_tokens_unpadded: int,
     num_tokens_padded: int,
     should_attempt_ubatching: bool,
     cudagraph_mode: int,
     parallel_config: ParallelConfig,
-) -> tuple[bool, torch.Tensor | None, int]:
+    moe_attention_phase: str | None = None,
+) -> tuple[bool, torch.Tensor | None, int, str | None]:
     """
     1. Decides if each DP rank is going to microbatch. Either all ranks
     run with microbatching or none of them do.
@@ -134,6 +156,7 @@ def _synchronize_dp_ranks(
         padded_num_tokens_per_ubatch=num_tokens_padded,
         cudagraph_mode=cudagraph_mode,
         parallel_config=parallel_config,
+        moe_attention_phase=moe_attention_phase,
     )
 
     # Synchronize cudagraph_mode across ranks first (take min).
@@ -158,7 +181,50 @@ def _synchronize_dp_ranks(
         should_dp_pad,
     )
 
-    return should_ubatch, num_tokens_after_padding, synced_cudagraph_mode
+    return (
+        should_ubatch,
+        num_tokens_after_padding,
+        synced_cudagraph_mode,
+        _post_process_moe_attention_phase(tensor, moe_attention_phase),
+    )
+
+
+def _coordinate_batch_across_dp(
+    num_tokens_unpadded: int,
+    allow_microbatching: bool,
+    parallel_config: ParallelConfig,
+    num_tokens_padded: int | None,
+    uniform_decode: bool | None,
+    cudagraph_mode: int,
+    moe_attention_phase: str | None,
+) -> tuple[bool, torch.Tensor | None, int, str | None]:
+    if moe_attention_phase is not None and (
+        moe_attention_phase not in _MOE_PHASE_CODES
+    ):
+        raise ValueError(f"unknown MoE attention phase: {moe_attention_phase}")
+    if parallel_config.data_parallel_size == 1:
+        return False, None, cudagraph_mode, moe_attention_phase
+
+    should_attempt_ubatching = False
+    if allow_microbatching:
+        assert uniform_decode is not None
+        should_attempt_ubatching = check_ubatch_thresholds(
+            parallel_config,
+            num_tokens_unpadded,
+            uniform_decode=uniform_decode,
+        )
+
+    if num_tokens_padded is None:
+        num_tokens_padded = num_tokens_unpadded
+
+    return _synchronize_dp_ranks(
+        num_tokens_unpadded,
+        num_tokens_padded,
+        should_attempt_ubatching,
+        cudagraph_mode,
+        parallel_config,
+        moe_attention_phase,
+    )
 
 
 def coordinate_batch_across_dp(
@@ -194,32 +260,41 @@ def coordinate_batch_across_dp(
     ]
 
     """
-    if parallel_config.data_parallel_size == 1:
-        # Early exit.
-        return False, None, cudagraph_mode
-
-    # If the caller has explicitly enabled microbatching.
-    should_attempt_ubatching = False
-    if allow_microbatching:
-        # Check preconditions for microbatching
-        assert uniform_decode is not None
-        should_attempt_ubatching = check_ubatch_thresholds(
+    should_ubatch, num_tokens_after_padding, synced_cudagraph_mode, _ = (
+        _coordinate_batch_across_dp(
+            num_tokens_unpadded,
+            allow_microbatching,
             parallel_config,
-            num_tokens_unpadded,
-            uniform_decode=uniform_decode,
-        )
-
-    if num_tokens_padded is None:
-        num_tokens_padded = num_tokens_unpadded
-
-    (should_ubatch, num_tokens_after_padding, synced_cudagraph_mode) = (
-        _synchronize_dp_ranks(
-            num_tokens_unpadded,
             num_tokens_padded,
-            should_attempt_ubatching,
+            uniform_decode,
             cudagraph_mode,
-            parallel_config,
+            None,
         )
     )
 
     return (should_ubatch, num_tokens_after_padding, synced_cudagraph_mode)
+
+
+def coordinate_batch_and_moe_phase_across_dp(
+    num_tokens_unpadded: int,
+    allow_microbatching: bool,
+    parallel_config: ParallelConfig,
+    moe_attention_phase: str,
+    num_tokens_padded: int | None = None,
+    uniform_decode: bool | None = None,
+    cudagraph_mode: int = 0,
+) -> tuple[bool, torch.Tensor | None, int, str]:
+    """Coordinate DBO, padding, graph mode, and MoE phase in one collective."""
+
+    result = _coordinate_batch_across_dp(
+        num_tokens_unpadded,
+        allow_microbatching,
+        parallel_config,
+        num_tokens_padded,
+        uniform_decode,
+        cudagraph_mode,
+        moe_attention_phase,
+    )
+    should_ubatch, tokens, synced_mode, synced_phase = result
+    assert synced_phase is not None
+    return should_ubatch, tokens, synced_mode, synced_phase

@@ -458,9 +458,7 @@ class Scheduler(SchedulerInterface):
 
         # DP prefill balancing: on a throttled (non-cadence-aligned) step, defer
         # all prefill compute unless saturated.
-        defer_prefills = (
-            throttle_prefills and not self.prefill_capacity_bound
-        ) and any(not r.is_prefill_chunk for r in self.running)
+        defer_prefills = throttle_prefills and not self.prefill_capacity_bound
 
         # First, schedule the RUNNING requests.
         req_index = 0

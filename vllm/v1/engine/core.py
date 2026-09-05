@@ -2014,11 +2014,13 @@ class DPEngineCoreProc(EngineCoreProc):
 
     def _should_throttle_prefills(self) -> bool:
         # Throttle new prefills to cadence-aligned steps for DP balancing.
-        # step_counter is identical across DP ranks. On a fresh wave the
-        # counter is 0, so prefills are admitted immediately after idle.
+        # step_counter is identical across DP ranks. Release at the end of a
+        # cadence interval rather than immediately at the start of a fresh
+        # wave; otherwise the first request message wins the race and a
+        # request-aligned DBO pair never has a chance to form.
         return (
             self.prefill_schedule_interval > 1
-            and self.step_counter % self.prefill_schedule_interval != 0
+            and (self.step_counter + 1) % self.prefill_schedule_interval != 0
         )
 
     def run_busy_loop(self):

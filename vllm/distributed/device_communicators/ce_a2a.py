@@ -11,12 +11,14 @@ device-only symmetric-memory P2P path.
 from __future__ import annotations
 
 import atexit
+import copy
 import os
+import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 import torch
 import torch.distributed as dist
@@ -42,6 +44,18 @@ logger = init_logger(__name__)
 # manager owns the scheduler lifetime; this registry only lets the opaque
 # custom op recover it when torch.compile or CUDAGraphWrapper invokes the op.
 _GRAPH_CONTROLS: dict[int, Any] = {}
+_CURRENT_UBATCH_ID: Callable[[], int] | None = None
+
+
+_Result = TypeVar("_Result")
+
+
+def _already_done(
+    result: _Result,
+) -> tuple[Callable[[], None], Callable[[], _Result]]:
+    """Expose an already-complete fallback through the split API."""
+
+    return lambda: None, lambda: result
 
 
 def _ce_a2a_exchange(
@@ -281,6 +295,32 @@ def _proxy_cpu_for_rank(
     return cpus[rank]
 
 
+def _worker_cpu_for_rank(
+    rank: int,
+    world_size: int,
+    cpu_map: str,
+) -> int | None:
+    """Resolve an optional topology-aware worker launch-thread map."""
+
+    if not cpu_map.strip():
+        return None
+    try:
+        cpus = [int(value.strip()) for value in cpu_map.split(",")]
+    except ValueError as exc:
+        raise ValueError(
+            "VLLM_CE_A2A_WORKER_CPU_MAP must contain integers"
+        ) from exc
+    if len(cpus) != world_size:
+        raise ValueError(
+            "VLLM_CE_A2A_WORKER_CPU_MAP must name exactly one CPU per rank"
+        )
+    if any(cpu < 0 for cpu in cpus) or len(set(cpus)) != len(cpus):
+        raise ValueError(
+            "VLLM_CE_A2A_WORKER_CPU_MAP CPUs must be unique and nonnegative"
+        )
+    return cpus[rank]
+
+
 def _ladder_views(
     arena: torch.Tensor,
     value_bytes: int,
@@ -481,6 +521,20 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         if parallel.enable_eplb or parallel.expert_placement_strategy != "linear":
             raise ValueError("CE A2A v1 requires linear expert placement without EPLB")
 
+        self.worker_cpu = _worker_cpu_for_rank(
+            self.rank,
+            self.world_size,
+            envs.VLLM_CE_A2A_WORKER_CPU_MAP,
+        )
+        if self.worker_cpu is not None:
+            allowed_cpus = os.sched_getaffinity(0)
+            if self.worker_cpu not in allowed_cpus:
+                raise ValueError(
+                    "VLLM_CE_A2A_WORKER_CPU_MAP selected a CPU outside the "
+                    "worker's allowed affinity"
+                )
+            os.sched_setaffinity(0, {self.worker_cpu})
+
         self.global_num_experts = _global_num_experts(config.model_config.hf_config)
         if self.global_num_experts % self.world_size:
             raise ValueError("global experts must divide evenly across CE A2A ranks")
@@ -628,6 +682,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         )
         self.delta_span_ratio: list[float] = []
         self._probe_state: tuple = ()
+        self.async_split = envs.VLLM_CE_A2A_ASYNC
         skew_log = os.environ.get("VLLM_CE_A2A_SKEW_LOG", "").strip()
         self.skew_recorder = (
             _SkewRecorder(
@@ -805,6 +860,11 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self.last_combine_send_counts: torch.Tensor | None = None
         self.last_combine_recv_counts: torch.Tensor | None = None
         self._active: _CeExchange | str | None = None
+        self._lanes: dict[int, CeA2AAll2AllManager] = {}
+        self._owner: CeA2AAll2AllManager | None = None
+        self._lane_id = 0
+        self._state_ready = False
+        self._build_lock = threading.Lock()
         self.ce_dispatch_calls = 0
         self.ce_combine_calls = 0
         self.ce_fp16_dispatch_calls = 0
@@ -1015,7 +1075,111 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             extra_tensors,
         )
 
+    def _lane(self) -> "CeA2AAll2AllManager":
+        """Return exchange state private to the current DBO microbatch."""
+
+        if self._owner is not None:
+            return self
+
+        global _CURRENT_UBATCH_ID
+        if _CURRENT_UBATCH_ID is None:
+            from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+            _CURRENT_UBATCH_ID = dbo_current_ubatch_id
+
+        index = _CURRENT_UBATCH_ID()
+        if index == 0:
+            return self
+        if index not in (0, 1):
+            raise RuntimeError(f"CE A2A supports exactly two DBO lanes, got {index}")
+        lane = self._lanes.get(index)
+        if lane is not None:
+            return lane
+
+        lane = copy.copy(self)
+        lane._owner = self
+        lane._lane_id = index
+        lane._state_ready = False
+        lane._lanes = {}
+        lane._build_lock = threading.Lock()
+        lane._control_handle = None
+        lane._active = None
+        lane._probe_state = ()
+        lane.delta_span_ratio = []
+        lane.last_dispatch_send_counts = None
+        lane.last_dispatch_recv_counts = None
+        lane.last_combine_send_counts = None
+        lane.last_combine_recv_counts = None
+        lane.layer_calls = 0
+        lane.layer_index = 0
+        lane.ce_dispatch_calls = 0
+        lane.ce_combine_calls = 0
+        lane.ce_fp16_dispatch_calls = 0
+        lane.ce_bf16_dispatch_calls = 0
+        lane.nccl_dispatch_calls = 0
+        lane.nccl_combine_calls = 0
+        lane.capacity_fallbacks = 0
+        lane.unsupported_fallbacks = 0
+        lane.min_rows_fallbacks = 0
+        lane.policy_fallbacks = dict.fromkeys(self.policy_fallbacks, 0)
+        lane.phase_dispatch_calls = dict.fromkeys(self.phase_dispatch_calls, 0)
+        lane.adaptive_dispatch_fallbacks = {}
+        lane.last_dispatch_path = None
+        lane.last_fallback_reason = None
+        lane.ce_dispatch_wire_bytes = 0
+        lane.ce_combine_wire_bytes = 0
+        lane.ce_dispatch_payload_bytes = 0
+        lane.ce_combine_payload_bytes = 0
+        lane.ce_dispatch_packets = 0
+        lane.ce_combine_packets = 0
+        lane.ce_dispatch_messages = 0
+        lane.ce_combine_messages = 0
+        lane.phase_exchanges = 0
+        lane.phase_cpu_ms = {}
+        lane.phase_cuda_events = {}
+        self._lanes[index] = lane
+        return lane
+
+    def _adopt_shared_state(self, owner: "CeA2AAll2AllManager") -> None:
+        """Refresh a lane's shared transport after the owner builds it."""
+
+        shared = (
+            "transport",
+            "packet_spec",
+            "control",
+            "dispatch_row_bytes",
+            "dispatch_floor_row",
+            "dispatch_target_row_bytes",
+            "dispatch_ladder_step",
+            "dispatch_groups",
+            "combine_row_bytes",
+            "combine_value_bytes",
+            "combine_floor_row",
+            "combine_ladder_step",
+            "combine_groups",
+            "codec_groups",
+            "dispatch_wire_dtype",
+            "combine_wire_dtype",
+        )
+        for key in shared:
+            self.__dict__[key] = owner.__dict__[key]
+
     def _ensure_transport(
+        self, hidden_size: int, top_k: int, compute_dtype: torch.dtype
+    ) -> None:
+        if self._owner is not None:
+            self._owner._ensure_transport(hidden_size, top_k, compute_dtype)
+            if not self._state_ready:
+                self._adopt_shared_state(self._owner)
+                self._allocate_lane_exchange_state(
+                    hidden_size, top_k, compute_dtype
+                )
+            return
+
+        with self._build_lock:
+            self._build_transport(hidden_size, top_k, compute_dtype)
+
+    def _build_transport(
         self, hidden_size: int, top_k: int, compute_dtype: torch.dtype
     ) -> None:
         from ce_a2a_moe import (
@@ -1477,6 +1641,231 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 self._control_handle = id(self.control)
                 _GRAPH_CONTROLS[self._control_handle] = self.control
 
+        self._state_ready = True
+
+    def _allocate_lane_exchange_state(
+        self, hidden_size: int, top_k: int, compute_dtype: torch.dtype
+    ) -> None:
+        """Allocate buffers that cannot be shared by concurrent DBO lanes."""
+
+        from ce_a2a_moe import FixedBlockDispatchBuilder, FusedBlockDispatchBuilder
+
+        assert self._owner is not None
+        assert self.packet_spec is not None
+        assert self.transport is not None
+        device = torch.cuda.current_device()
+        dispatch_wire_dtype = (
+            compute_dtype if self.dispatch_bits else torch.float16
+        )
+        combine_wire_dtype = compute_dtype if self.combine_bits else torch.float16
+
+        builder_type = (
+            FusedBlockDispatchBuilder
+            if self.packet_builder_kind == "fused"
+            else FixedBlockDispatchBuilder
+        )
+        builder_options: dict[str, Any] = {}
+        if self.delta_max_edge:
+            builder_options["max_activation_bits"] = self.dispatch_bits + 1
+        if self.width_balance:
+            builder_options["max_activation_bits"] = self.width_balance_max_bits
+        if builder_type is FusedBlockDispatchBuilder:
+            builder_options["activation_dtype"] = dispatch_wire_dtype
+        elif dispatch_wire_dtype != torch.float16:
+            raise ValueError("the fixed packet builder does not support BF16; use fused")
+        self.packet_builder = builder_type(
+            spec=self.packet_spec,
+            experts_per_rank=self.experts_per_rank,
+            world_size=self.world_size,
+            max_edge_rows=self.max_edge_rows,
+            device=device,
+            **builder_options,
+        )
+        self.dispatch_reference = None
+        if self.delta_dispatch:
+            self.packet_builder.enable_delta(
+                self.max_edge_rows, margin=self.delta_margin
+            )
+            self.dispatch_reference = torch.zeros(
+                (self.world_size, self.max_edge_rows, hidden_size),
+                dtype=dispatch_wire_dtype,
+                device=device,
+            )
+
+        self._ce_wire_bytes_device = torch.zeros(
+            2, dtype=torch.int64, device=device
+        )
+        self._ce_payload_bytes_device = torch.zeros_like(
+            self._ce_wire_bytes_device
+        )
+        self._ce_packet_counts_device = torch.zeros_like(
+            self._ce_wire_bytes_device
+        )
+        self._ce_message_counts_device = torch.zeros_like(
+            self._ce_wire_bytes_device
+        )
+        self._dispatch_effective_inputs_device = torch.zeros(
+            2, dtype=torch.int64, device=device
+        )
+
+        block_rows = self.max_edge_rows + 1
+        total_rows = self.world_size * block_rows
+        self.recv_counts_device = torch.empty(
+            self.world_size, dtype=torch.int32, device=device
+        )
+        self.global_count_matrix = None
+        self.global_count_matrix_flat = None
+        if self.edge_schedule == "ep8_dual_numa_adaptive_v1" or self.width_balance:
+            self.global_count_matrix_flat = torch.empty(
+                self.world_size * self.world_size,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.global_count_matrix = self.global_count_matrix_flat.view(
+                self.world_size, self.world_size
+            )
+
+        self.dispatch_width_quanta = None
+        self.dispatch_width_row_bytes = None
+        self.dispatch_width_accounting = None
+        self.combine_width_quanta = None
+        self.combine_width_row_bytes = None
+        self.combine_width_accounting = None
+        self.dispatch_send_row_bytes = None
+        self.dispatch_recv_row_bytes = None
+        self.combine_send_row_bytes = None
+        self.combine_recv_row_bytes = None
+        if self.width_balance:
+            matrix_shape = (self.world_size, self.world_size)
+            self.dispatch_width_quanta = torch.empty(
+                matrix_shape, dtype=torch.int32, device=device
+            )
+            self.dispatch_width_row_bytes = torch.empty_like(
+                self.dispatch_width_quanta
+            )
+            self.dispatch_width_accounting = torch.empty(
+                4, dtype=torch.int64, device=device
+            )
+            self.combine_width_quanta = torch.empty_like(
+                self.dispatch_width_quanta
+            )
+            self.combine_width_row_bytes = torch.empty_like(
+                self.dispatch_width_quanta
+            )
+            self.combine_width_accounting = torch.empty_like(
+                self.dispatch_width_accounting
+            )
+            self.dispatch_send_row_bytes = self.dispatch_width_row_bytes[
+                self.rank
+            ]
+            self.dispatch_recv_row_bytes = self.dispatch_width_row_bytes[
+                :, self.rank
+            ]
+            self.combine_send_row_bytes = self.combine_width_row_bytes[
+                self.rank
+            ]
+            self.combine_recv_row_bytes = self.combine_width_row_bytes[
+                :, self.rank
+            ]
+
+        self.fill_count_send = None
+        self.fill_count_recv = None
+        if self.combine_fill or self.delta_max_edge:
+            self.fill_count_send = torch.empty(
+                (self.world_size, 2), dtype=torch.int32, device=device
+            )
+            self.fill_count_recv = torch.empty_like(self.fill_count_send)
+
+        self.dispatch_recv_blocks = self.transport._inbox_view(
+            self.transport.dispatch_inbox,
+            dtype=torch.uint8,
+            row_elements=self.dispatch_row_bytes,
+            lane=self._lane_id,
+        ).local
+        if not self.dispatch_recv_blocks.is_contiguous():
+            raise RuntimeError("direct dispatch inbox must be contiguous")
+        self.dispatch_ladder = None
+        self.dispatch_ladder_recv = None
+        if self.delta_max_edge:
+            self.dispatch_ladder = torch.zeros_like(self.recv_counts_device)
+            self.dispatch_ladder_recv = torch.zeros_like(self.recv_counts_device)
+            self.dispatch_send_row_bytes = torch.zeros_like(
+                self.recv_counts_device
+            )
+            self.dispatch_recv_row_bytes = torch.zeros_like(
+                self.recv_counts_device
+            )
+        self.fixed_recv_hidden = torch.empty(
+            (total_rows, hidden_size), dtype=dispatch_wire_dtype, device=device
+        )
+        self.fixed_recv_ids = torch.empty(
+            (total_rows, top_k), dtype=torch.int32, device=device
+        )
+        self.fixed_recv_weights = torch.empty(
+            (total_rows, top_k), dtype=torch.float32, device=device
+        )
+
+        self.combine_send_blocks = None
+        self.combine_ladder = None
+        self.combine_ladder_recv = None
+        if self.combine_bits:
+            self.combine_send_blocks = torch.empty(
+                (self.world_size, block_rows, self.combine_row_bytes),
+                dtype=torch.uint8,
+                device=device,
+            )
+            self.combine_recv_blocks = self.transport._inbox_view(
+                self.transport.combine_inbox,
+                dtype=torch.uint8,
+                row_elements=self.combine_row_bytes,
+                lane=self._lane_id,
+            ).local
+            if not self.combine_recv_blocks.is_contiguous():
+                raise RuntimeError("direct combine inbox must be contiguous")
+            if self.combine_ladder_g:
+                self.combine_ladder = torch.full(
+                    (self.world_size,),
+                    self.combine_ladder_g,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                if self.combine_fill:
+                    from ce_a2a_moe.ladder import (
+                        ladder_group_bytes as _group_bytes,
+                        ladder_row_bytes as _row_bytes,
+                    )
+
+                    self.combine_ladder_recv = torch.zeros_like(
+                        self.combine_ladder
+                    )
+                    self.combine_send_row_bytes = torch.zeros_like(
+                        self.combine_ladder
+                    )
+                    self.combine_recv_row_bytes = torch.zeros_like(
+                        self.combine_ladder
+                    )
+                    self.combine_floor_row = _row_bytes(
+                        hidden_size,
+                        self.combine_bits,
+                        0,
+                        self.codec_group_size,
+                    )
+                    self.combine_ladder_step = _group_bytes(
+                        self.codec_group_size, self.combine_bits + 1
+                    ) - _group_bytes(self.codec_group_size, self.combine_bits)
+                    self.combine_groups = hidden_size // self.codec_group_size
+        else:
+            self.combine_recv_blocks = self.transport._inbox_view(
+                self.transport.combine_inbox,
+                dtype=combine_wire_dtype,
+                row_elements=hidden_size,
+                lane=self._lane_id,
+            ).local
+            if not self.combine_recv_blocks.is_contiguous():
+                raise RuntimeError("direct combine inbox must be contiguous")
+
+        self._state_ready = True
+
     def _submit_fixed_exchange(
         self,
         phase: int,
@@ -1490,6 +1879,34 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         global_count_matrix: torch.Tensor | None = None,
         global_count_matrix_transposed: bool = False,
     ) -> None:
+        self._launch_fixed_exchange(
+            phase,
+            send,
+            send_counts,
+            recv,
+            recv_counts,
+            send_row_bytes,
+            recv_row_bytes,
+            geometry_stage,
+            global_count_matrix,
+            global_count_matrix_transposed,
+        )()
+
+    def _launch_fixed_exchange(
+        self,
+        phase: int,
+        send: torch.Tensor,
+        send_counts: torch.Tensor,
+        recv: torch.Tensor,
+        recv_counts: torch.Tensor,
+        send_row_bytes: torch.Tensor | None = None,
+        recv_row_bytes: torch.Tensor | None = None,
+        geometry_stage: Any | None = None,
+        global_count_matrix: torch.Tensor | None = None,
+        global_count_matrix_transposed: bool = False,
+    ) -> Callable[[], None]:
+        """Start a fixed exchange and return its completion dependency."""
+
         assert self.control is not None
         if self.control_kind == "graph_proxy":
             if geometry_stage is not None:
@@ -1509,7 +1926,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 self._control_handle,
                 phase,
             )
-            return
+            return lambda: None
         submit_options = {}
         if geometry_stage is not None:
             if self.control_kind != "native_proxy":
@@ -1526,8 +1943,28 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             submit_options["global_count_matrix_transposed"] = (
                 global_count_matrix_transposed
             )
+        if self.control_kind != "native_proxy":
+            submit_args = (
+                "dispatch" if phase == 0 else "combine",
+                send,
+                send_counts,
+                recv,
+                recv_counts,
+            )
+            if send_row_bytes is None:
+                self.control.submit(*submit_args, **submit_options)
+            else:
+                self.control.submit(
+                    *submit_args,
+                    send_row_bytes,
+                    recv_row_bytes,
+                    **submit_options,
+                )
+            return lambda: None
+
+        submit_options["lane"] = self._lane_id
         if send_row_bytes is None:
-            self.control.submit(
+            return self.control.submit_async(
                 "dispatch" if phase == 0 else "combine",
                 send,
                 send_counts,
@@ -1535,7 +1972,6 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 recv_counts,
                 **submit_options,
             )
-            return
         # Only controls with a per-edge width ABI may carry adaptive packets.
         if self.control_kind not in ("native_proxy", "exact_nccl"):
             raise RuntimeError(
@@ -1543,7 +1979,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 f"or exact_nccl, "
                 f"got {self.control_kind}"
             )
-        self.control.submit(
+        return self.control.submit_async(
             "dispatch" if phase == 0 else "combine",
             send,
             send_counts,
@@ -1610,6 +2046,37 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         is_sequence_parallel: bool = False,
         extra_tensors: list[torch.Tensor] | None = None,
     ):
+        hook, receiver = self.dispatch_async(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            is_sequence_parallel,
+            extra_tensors,
+        )
+        hook()
+        return receiver()
+
+    def supports_async(self) -> bool:
+        return self.async_split and self.control_kind == "native_proxy"
+
+    def dispatch_async(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        is_sequence_parallel: bool = False,
+        extra_tensors: list[torch.Tensor] | None = None,
+    ) -> tuple[Callable[[], None], Callable[[], Any]]:
+        lane = self._lane()
+        if lane is not self:
+            return lane.dispatch_async(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                is_sequence_parallel,
+                extra_tensors,
+            )
+
         if self._active is not None:
             raise RuntimeError("CE A2A dispatch called before the prior combine")
 
@@ -1622,13 +2089,15 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self.phase_dispatch_calls[phase] += 1
         policy_reason = _prefill_policy_fallback_reason(phase)
         if self.prefill_only and policy_reason is not None:
-            return self._fallback_dispatch(
-                hidden_states,
-                topk_weights,
-                topk_ids,
-                is_sequence_parallel,
-                extra_tensors,
-                reason=policy_reason,
+            return _already_done(
+                self._fallback_dispatch(
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    is_sequence_parallel,
+                    extra_tensors,
+                    reason=policy_reason,
+                )
             )
 
         comm_group = self._get_comm_group(is_sequence_parallel)
@@ -1643,31 +2112,37 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             or topk_ids.ndim != 2
         )
         if unsupported:
-            return self._fallback_dispatch(
-                hidden_states,
-                topk_weights,
-                topk_ids,
-                is_sequence_parallel,
-                extra_tensors,
-                reason="unsupported",
+            return _already_done(
+                self._fallback_dispatch(
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    is_sequence_parallel,
+                    extra_tensors,
+                    reason="unsupported",
+                )
             )
         if global_rows < self.min_global_rows:
-            return self._fallback_dispatch(
-                hidden_states,
-                topk_weights,
-                topk_ids,
-                is_sequence_parallel,
-                extra_tensors,
-                reason="min_rows",
+            return _already_done(
+                self._fallback_dispatch(
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    is_sequence_parallel,
+                    extra_tensors,
+                    reason="min_rows",
+                )
             )
         if max(sizes, default=0) > self.max_edge_rows:
-            return self._fallback_dispatch(
-                hidden_states,
-                topk_weights,
-                topk_ids,
-                is_sequence_parallel,
-                extra_tensors,
-                reason="capacity",
+            return _already_done(
+                self._fallback_dispatch(
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                    is_sequence_parallel,
+                    extra_tensors,
+                    reason="capacity",
+                )
             )
 
         from ce_a2a_moe import (
@@ -1892,6 +2367,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         dispatch_control_recv_counts,
                         dispatch_send_row_bytes,
                         dispatch_recv_row_bytes,
+                        lane=self._lane_id,
                     )
                 with self._timed_phase("dispatch_pack"):
                     coalesced = self.packet_builder.pack_prepared_multirung(
@@ -1945,6 +2421,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         dispatch_send_row_bytes,
                         dispatch_recv_row_bytes,
                         global_count_matrix,
+                        lane=self._lane_id,
                     )
                 with self._timed_phase("dispatch_pack"):
                     coalesced = self.packet_builder.pack_prepared_ladder(
@@ -1999,7 +2476,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     self._timed_phase("dispatch_control"),
                     record_function("moe.ce_a2a.dispatch_control"),
                 ):
-                    self._submit_fixed_exchange(
+                    dispatch_wait = self._launch_fixed_exchange(
                         0,
                         coalesced.packets,
                         dispatch_control_send_counts,
@@ -2034,82 +2511,14 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 )
 
         if self.control_kind != "host_sync":
-            assert self.dispatch_recv_blocks is not None
-            assert self.fixed_recv_hidden is not None
-            assert self.fixed_recv_ids is not None
-            assert self.fixed_recv_weights is not None
             assert coalesced.token_positions is not None
-            with (
-                self._timed_phase("dispatch_unpack"),
-                record_function("moe.ce_a2a.unpack"),
-            ):
-                if self.width_balance:
-                    from ce_a2a_moe import unpack_multirung_dispatch_blocks
-
-                    assert self.dispatch_width_quanta is not None
-                    recv_hidden, recv_topk_ids, recv_topk_weights = (
-                        unpack_multirung_dispatch_blocks(
-                            self.dispatch_recv_blocks,
-                            recv_counts_device,
-                            self.dispatch_width_quanta[:, self.rank],
-                            spec=self.packet_spec,
-                            maximum_bits=self.width_balance_max_bits,
-                            expert_rank=self.rank,
-                            experts_per_rank=self.experts_per_rank,
-                            output_hidden=self.fixed_recv_hidden,
-                            output_ids=self.fixed_recv_ids,
-                            output_weights=self.fixed_recv_weights,
-                            reference=self.dispatch_reference,
-                        )
-                    )
-                elif self.delta_max_edge:
-                    from ce_a2a_moe import unpack_ladder_dispatch_blocks
-
-                    assert self.dispatch_ladder_recv is not None
-                    assert self.dispatch_reference is not None
-                    recv_hidden, recv_topk_ids, recv_topk_weights = (
-                        unpack_ladder_dispatch_blocks(
-                            self.dispatch_recv_blocks,
-                            recv_counts_device,
-                            self.dispatch_ladder_recv,
-                            spec=self.packet_spec,
-                            expert_rank=self.rank,
-                            experts_per_rank=self.experts_per_rank,
-                            output_hidden=self.fixed_recv_hidden,
-                            output_ids=self.fixed_recv_ids,
-                            output_weights=self.fixed_recv_weights,
-                            reference=self.dispatch_reference,
-                        )
-                    )
-                else:
-                    recv_hidden, recv_topk_ids, recv_topk_weights = (
-                        unpack_fixed_dispatch_blocks(
-                            self.dispatch_recv_blocks,
-                            recv_counts_device,
-                            spec=self.packet_spec,
-                            expert_rank=self.rank,
-                            experts_per_rank=self.experts_per_rank,
-                            output_hidden=self.fixed_recv_hidden,
-                            output_ids=self.fixed_recv_ids,
-                            output_weights=self.fixed_recv_weights,
-                            reference=self.dispatch_reference,
-                        )
-                    )
-            self._active = _CeExchange(
+            return dispatch_wait, lambda: self._receive_fixed_dispatch(
+                recv_counts_device=recv_counts_device,
                 send_counts=send_counts,
-                recv_counts=recv_counts,
-                owner_token_ids=None,
                 token_positions=coalesced.token_positions,
                 local_rows=int(hidden_states.shape[0]),
-                fixed_control=True,
                 output_dtype=output_dtype,
                 global_count_matrix=global_count_matrix,
-            )
-            self.ce_dispatch_calls += 1
-            return (
-                _from_ce_wire(recv_hidden, output_dtype),
-                recv_topk_weights,
-                recv_topk_ids,
             )
 
         recv_packets = torch.empty(
@@ -2153,6 +2562,100 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             output_dtype=output_dtype,
         )
         self.ce_dispatch_calls += 1
+        return _already_done(
+            (
+                _from_ce_wire(recv_hidden, output_dtype),
+                recv_topk_weights,
+                recv_topk_ids,
+            )
+        )
+
+    def _receive_fixed_dispatch(
+        self,
+        *,
+        recv_counts_device: torch.Tensor,
+        send_counts: torch.Tensor,
+        token_positions: torch.Tensor,
+        local_rows: int,
+        output_dtype: torch.dtype,
+        global_count_matrix: torch.Tensor | None,
+    ):
+        """Unpack one lane after its deferred dispatch dependency is installed."""
+
+        from ce_a2a_moe import unpack_fixed_dispatch_blocks
+
+        assert self.packet_spec is not None
+        assert self.dispatch_recv_blocks is not None
+        assert self.fixed_recv_hidden is not None
+        assert self.fixed_recv_ids is not None
+        assert self.fixed_recv_weights is not None
+        with (
+            self._timed_phase("dispatch_unpack"),
+            record_function("moe.ce_a2a.unpack"),
+        ):
+            if self.width_balance:
+                from ce_a2a_moe import unpack_multirung_dispatch_blocks
+
+                assert self.dispatch_width_quanta is not None
+                recv_hidden, recv_topk_ids, recv_topk_weights = (
+                    unpack_multirung_dispatch_blocks(
+                        self.dispatch_recv_blocks,
+                        recv_counts_device,
+                        self.dispatch_width_quanta[:, self.rank],
+                        spec=self.packet_spec,
+                        maximum_bits=self.width_balance_max_bits,
+                        expert_rank=self.rank,
+                        experts_per_rank=self.experts_per_rank,
+                        output_hidden=self.fixed_recv_hidden,
+                        output_ids=self.fixed_recv_ids,
+                        output_weights=self.fixed_recv_weights,
+                        reference=self.dispatch_reference,
+                    )
+                )
+            elif self.delta_max_edge:
+                from ce_a2a_moe import unpack_ladder_dispatch_blocks
+
+                assert self.dispatch_ladder_recv is not None
+                assert self.dispatch_reference is not None
+                recv_hidden, recv_topk_ids, recv_topk_weights = (
+                    unpack_ladder_dispatch_blocks(
+                        self.dispatch_recv_blocks,
+                        recv_counts_device,
+                        self.dispatch_ladder_recv,
+                        spec=self.packet_spec,
+                        expert_rank=self.rank,
+                        experts_per_rank=self.experts_per_rank,
+                        output_hidden=self.fixed_recv_hidden,
+                        output_ids=self.fixed_recv_ids,
+                        output_weights=self.fixed_recv_weights,
+                        reference=self.dispatch_reference,
+                    )
+                )
+            else:
+                recv_hidden, recv_topk_ids, recv_topk_weights = (
+                    unpack_fixed_dispatch_blocks(
+                        self.dispatch_recv_blocks,
+                        recv_counts_device,
+                        spec=self.packet_spec,
+                        expert_rank=self.rank,
+                        experts_per_rank=self.experts_per_rank,
+                        output_hidden=self.fixed_recv_hidden,
+                        output_ids=self.fixed_recv_ids,
+                        output_weights=self.fixed_recv_weights,
+                        reference=self.dispatch_reference,
+                    )
+                )
+        self._active = _CeExchange(
+            send_counts=send_counts,
+            recv_counts=recv_counts_device,
+            owner_token_ids=None,
+            token_positions=token_positions,
+            local_rows=local_rows,
+            fixed_control=True,
+            output_dtype=output_dtype,
+            global_count_matrix=global_count_matrix,
+        )
+        self.ce_dispatch_calls += 1
         return (
             _from_ce_wire(recv_hidden, output_dtype),
             recv_topk_weights,
@@ -2162,6 +2665,17 @@ class CeA2AAll2AllManager(All2AllManagerBase):
     def combine(
         self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
     ) -> torch.Tensor:
+        hook, receiver = self.combine_async(hidden_states, is_sequence_parallel)
+        hook()
+        return receiver()
+
+    def combine_async(
+        self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
+    ) -> tuple[Callable[[], None], Callable[[], torch.Tensor]]:
+        lane = self._lane()
+        if lane is not self:
+            return lane.combine_async(hidden_states, is_sequence_parallel)
+
         active = self._active
         if active is None:
             raise RuntimeError(
@@ -2171,7 +2685,9 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         if active == "nccl":
             self._active = None
             self.nccl_combine_calls += 1
-            return self.fallback.combine(hidden_states, is_sequence_parallel)
+            return _already_done(
+                self.fallback.combine(hidden_states, is_sequence_parallel)
+            )
         assert isinstance(active, _CeExchange)
         if is_sequence_parallel:
             raise RuntimeError("CE A2A state cannot be combined as sequence parallel")
@@ -2239,6 +2755,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     global_count_matrix_transposed=(
                         active.global_count_matrix is not None
                     ),
+                    lane=self._lane_id,
                 )
             if self.width_balance:
                 assert self.combine_send_blocks is not None
@@ -2257,6 +2774,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         combine_control_recv_counts,
                         combine_width_send_row_bytes,
                         combine_width_recv_row_bytes,
+                        lane=self._lane_id,
                     )
                 from ce_a2a_moe.ladder import quantize_pack_multirung_inline
 
@@ -2327,6 +2845,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                             global_count_matrix_transposed=(
                                 active.global_count_matrix is not None
                             ),
+                            lane=self._lane_id,
                         )
                 with (
                     self._timed_phase("combine_pack"),
@@ -2421,7 +2940,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                             else self.combine_row_bytes
                         ),
                     )
-                    self._submit_fixed_exchange(
+                    combine_wait = self._launch_fixed_exchange(
                         1,
                         blocks,
                         combine_control_send_counts,
@@ -2447,80 +2966,12 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                             self.edge_schedule == "ep8_dual_numa_adaptive_v1"
                         ),
                     )
-            with (
-                self._timed_phase("owner_reduce"),
-                record_function("moe.ce_a2a.owner_reduce"),
-            ):
-                if self.width_balance:
-                    from ce_a2a_moe.ladder import reduce_multirung_inline
-
-                    assert self.combine_width_quanta is not None
-                    output = reduce_multirung_inline(
-                        self.combine_recv_blocks,
-                        self.combine_width_quanta[:, self.rank],
-                        active.token_positions,
-                        block_rows=block_rows,
-                        local_rows=active.local_rows,
-                        hidden_size=hidden_size,
-                        minimum_bits=self.width_balance_min_bits,
-                        maximum_bits=self.width_balance_max_bits,
-                        group_size=self.codec_group_size,
-                        output_dtype=active.output_dtype,
-                    )
-                elif self.combine_fill:
-                    from ce_a2a_moe.ladder import reduce_ladder_inline
-
-                    output = reduce_ladder_inline(
-                        self.combine_recv_blocks,
-                        self.combine_ladder_recv,
-                        active.token_positions,
-                        block_rows=block_rows,
-                        local_rows=active.local_rows,
-                        hidden_size=hidden_size,
-                        base_bits=self.combine_bits,
-                        group_size=self.codec_group_size,
-                        output_dtype=wire_hidden_states.dtype,
-                    )
-                elif self.combine_ladder_g:
-                    from ce_a2a_moe.ladder import reduce_ladder_owner_partials
-
-                    values, scales = _ladder_views(
-                        self.combine_recv_blocks,
-                        self.combine_value_bytes,
-                        wire_hidden_states.dtype,
-                    )
-                    output = reduce_ladder_owner_partials(
-                        values,
-                        scales,
-                        self.combine_ladder,
-                        active.token_positions,
-                        local_rows=active.local_rows,
-                        hidden_size=hidden_size,
-                        base_bits=self.combine_bits,
-                        group_size=self.codec_group_size,
-                        row_pitch=self.combine_row_bytes,
-                        output_dtype=wire_hidden_states.dtype,
-                    )
-                elif self.combine_bits:
-                    output = reduce_packed_owner_partials(
-                        self.combine_recv_blocks,
-                        active.token_positions,
-                        local_rows=active.local_rows,
-                        hidden_size=hidden_size,
-                        bits=self.combine_bits,
-                        group_size=self.codec_group_size,
-                        output_dtype=wire_hidden_states.dtype,
-                    )
-                else:
-                    output = reduce_fixed_owner_partials(
-                        self.combine_recv_blocks,
-                        active.token_positions,
-                        local_rows=active.local_rows,
-                    )
-            self._active = None
-            self.ce_combine_calls += 1
-            self.phase_exchanges += 1
-            return _from_ce_wire(output, active.output_dtype)
+            return combine_wait, lambda: self._receive_fixed_combine(
+                active=active,
+                block_rows=block_rows,
+                hidden_size=hidden_size,
+                wire_dtype=wire_hidden_states.dtype,
+            )
 
         assert isinstance(active.send_counts, tuple)
         assert isinstance(active.recv_counts, tuple)
@@ -2560,6 +3011,100 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 active.owner_token_ids,
                 local_rows=active.local_rows,
             )
+        self._active = None
+        self.ce_combine_calls += 1
+        self.phase_exchanges += 1
+        return _already_done(_from_ce_wire(output, active.output_dtype))
+
+    def _receive_fixed_combine(
+        self,
+        *,
+        active: _CeExchange,
+        block_rows: int,
+        hidden_size: int,
+        wire_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Reduce one lane after its deferred combine dependency is installed."""
+
+        from ce_a2a_moe import (
+            reduce_fixed_owner_partials,
+            reduce_packed_owner_partials,
+        )
+
+        assert self.combine_recv_blocks is not None
+        assert active.token_positions is not None
+        with (
+            self._timed_phase("owner_reduce"),
+            record_function("moe.ce_a2a.owner_reduce"),
+        ):
+            if self.width_balance:
+                from ce_a2a_moe.ladder import reduce_multirung_inline
+
+                assert self.combine_width_quanta is not None
+                output = reduce_multirung_inline(
+                    self.combine_recv_blocks,
+                    self.combine_width_quanta[:, self.rank],
+                    active.token_positions,
+                    block_rows=block_rows,
+                    local_rows=active.local_rows,
+                    hidden_size=hidden_size,
+                    minimum_bits=self.width_balance_min_bits,
+                    maximum_bits=self.width_balance_max_bits,
+                    group_size=self.codec_group_size,
+                    output_dtype=active.output_dtype,
+                )
+            elif self.combine_fill:
+                from ce_a2a_moe.ladder import reduce_ladder_inline
+
+                assert self.combine_ladder_recv is not None
+                output = reduce_ladder_inline(
+                    self.combine_recv_blocks,
+                    self.combine_ladder_recv,
+                    active.token_positions,
+                    block_rows=block_rows,
+                    local_rows=active.local_rows,
+                    hidden_size=hidden_size,
+                    base_bits=self.combine_bits,
+                    group_size=self.codec_group_size,
+                    output_dtype=wire_dtype,
+                )
+            elif self.combine_ladder_g:
+                from ce_a2a_moe.ladder import reduce_ladder_owner_partials
+
+                assert self.combine_ladder is not None
+                values, scales = _ladder_views(
+                    self.combine_recv_blocks,
+                    self.combine_value_bytes,
+                    wire_dtype,
+                )
+                output = reduce_ladder_owner_partials(
+                    values,
+                    scales,
+                    self.combine_ladder,
+                    active.token_positions,
+                    local_rows=active.local_rows,
+                    hidden_size=hidden_size,
+                    base_bits=self.combine_bits,
+                    group_size=self.codec_group_size,
+                    row_pitch=self.combine_row_bytes,
+                    output_dtype=wire_dtype,
+                )
+            elif self.combine_bits:
+                output = reduce_packed_owner_partials(
+                    self.combine_recv_blocks,
+                    active.token_positions,
+                    local_rows=active.local_rows,
+                    hidden_size=hidden_size,
+                    bits=self.combine_bits,
+                    group_size=self.codec_group_size,
+                    output_dtype=wire_dtype,
+                )
+            else:
+                output = reduce_fixed_owner_partials(
+                    self.combine_recv_blocks,
+                    active.token_positions,
+                    local_rows=active.local_rows,
+                )
         self._active = None
         self.ce_combine_calls += 1
         self.phase_exchanges += 1
@@ -2870,13 +3415,78 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         }
         if self.skew_recorder is not None:
             result["skew"].update(self.skew_recorder.summary())
+        if self._owner is None and self._lanes:
+            lane_results = [
+                lane.diagnostics()
+                for _, lane in sorted(self._lanes.items())
+            ]
+            additive = (
+                "ce_dispatch_calls",
+                "ce_combine_calls",
+                "ce_fp16_dispatch_calls",
+                "ce_bf16_dispatch_calls",
+                "nccl_dispatch_calls",
+                "nccl_combine_calls",
+                "capacity_fallbacks",
+                "min_rows_fallbacks",
+                "unsupported_fallbacks",
+                "actual_dispatch_wire_bytes",
+                "actual_combine_wire_bytes",
+                "actual_total_wire_bytes",
+                "actual_dispatch_payload_bytes",
+                "actual_combine_payload_bytes",
+                "actual_total_payload_bytes",
+                "actual_dispatch_packets",
+                "actual_combine_packets",
+                "actual_total_packets",
+                "actual_dispatch_messages",
+                "actual_combine_messages",
+                "actual_total_messages",
+                "phase_exchanges",
+                "layer_calls",
+            )
+            for lane_result in lane_results:
+                for key in additive:
+                    result[key] += lane_result[key]
+                for map_key in (
+                    "policy_fallbacks",
+                    "phase_dispatch_calls",
+                    "adaptive_dispatch_fallbacks",
+                ):
+                    for key, value in lane_result[map_key].items():
+                        result[map_key][key] = result[map_key].get(key, 0) + value
+                for timing_kind in ("phase_cpu_ms", "phase_cuda_ms"):
+                    for key, value in lane_result[timing_kind].items():
+                        result[timing_kind][key] = round(
+                            result[timing_kind].get(key, 0.0) + value, 3
+                        )
+                result["pace_cuda_ms"] = round(
+                    result["pace_cuda_ms"] + lane_result["pace_cuda_ms"], 3
+                )
+            result["dbo_lane_count"] = 1 + len(lane_results)
+            result["dbo_lanes"] = [
+                {
+                    "lane": index,
+                    "ce_dispatch_calls": lane.ce_dispatch_calls,
+                    "ce_combine_calls": lane.ce_combine_calls,
+                    "layer_calls": lane.layer_calls,
+                }
+                for index, lane in sorted(self._lanes.items())
+            ]
+        else:
+            result["dbo_lane_count"] = 1
+            result["dbo_lanes"] = []
         return result
 
     def destroy(self) -> None:
+        if self._owner is None:
+            for lane in self._lanes.values():
+                lane.destroy()
+            self._lanes.clear()
         if self._control_handle is not None:
             _GRAPH_CONTROLS.pop(self._control_handle, None)
             self._control_handle = None
-        if self.control is not None:
+        if self.control is not None and self._owner is None:
             self.control.close()
             self.control = None
         self.transport = None

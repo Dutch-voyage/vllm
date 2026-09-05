@@ -104,6 +104,26 @@ class All2AllManagerBase:
         # - raise a clear error if extra_tensors is not supported.
         raise NotImplementedError
 
+    def supports_async(self) -> bool:
+        """Whether dispatch/combine can return separate wait and receive hooks."""
+
+        return False
+
+    def dispatch_async(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        is_sequence_parallel: bool = False,
+        extra_tensors: list[torch.Tensor] | None = None,
+    ):
+        raise NotImplementedError
+
+    def combine_async(
+        self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
+    ):
+        raise NotImplementedError
+
     def query_active_mask(self) -> torch.Tensor:
         raise NotImplementedError
 
@@ -383,6 +403,26 @@ class DeviceCommunicatorBase:
         This is a no-op in the base class.
         """
         return hidden_states
+
+    def supports_dispatch_combine_async(self) -> bool:
+        """Whether this communicator can split exchange launch from its wait."""
+
+        return False
+
+    def dispatch_async(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        is_sequence_parallel: bool = False,
+        extra_tensors: list[torch.Tensor] | None = None,
+    ):
+        raise NotImplementedError
+
+    def combine_async(
+        self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
+    ):
+        raise NotImplementedError
 
     def batch_isend_irecv(self, p2p_ops: list):
         raise NotImplementedError

@@ -27,6 +27,56 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 
 @pytest.mark.parametrize(
+    ("kwargs", "supported"),
+    [
+        (
+            {
+                "enable_dbo": True,
+                "all2all_backend": "ce_a2a",
+                "max_num_partial_prefills": 2,
+                "max_long_partial_prefills": 2,
+            },
+            True,
+        ),
+        (
+            {
+                "enable_dbo": False,
+                "all2all_backend": "ce_a2a",
+                "max_num_partial_prefills": 2,
+                "max_long_partial_prefills": 2,
+            },
+            False,
+        ),
+        (
+            {
+                "enable_dbo": True,
+                "all2all_backend": "naive",
+                "max_num_partial_prefills": 2,
+                "max_long_partial_prefills": 2,
+            },
+            False,
+        ),
+        (
+            {
+                "enable_dbo": True,
+                "all2all_backend": "ce_a2a",
+                "max_num_partial_prefills": 2,
+                "max_long_partial_prefills": 1,
+            },
+            False,
+        ),
+    ],
+)
+def test_concurrent_partial_prefill_is_scoped_to_ce_dbo(kwargs, supported):
+    args = EngineArgs(**kwargs)
+    if supported:
+        args._check_feature_supported()
+    else:
+        with pytest.raises(NotImplementedError, match="Concurrent Partial Prefill"):
+            args._check_feature_supported()
+
+
+@pytest.mark.parametrize(
     ("type", "value", "expected"),
     [
         (int, "42", 42),

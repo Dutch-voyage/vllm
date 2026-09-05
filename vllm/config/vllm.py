@@ -1534,9 +1534,10 @@ class VllmConfig:
                 "deepep_low_latency",
                 "deepep_high_throughput",
                 "nixl_ep",
+                "ce_a2a",
             ], (
                 "Microbatching currently only supports the deepep_low_latency, "
-                "deepep_high_throughput, and nixl_ep all2all backends. "
+                "deepep_high_throughput, nixl_ep, and ce_a2a all2all backends. "
                 f"{a2a_backend} is not supported. To fix use "
                 "--all2all-backend=deepep_low_latency, "
                 "--all2all-backend=deepep_high_throughput, or "

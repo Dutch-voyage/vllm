@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 from typing import TypeAlias
 
@@ -105,6 +106,8 @@ def maybe_create_ubatch_slices(
 
         start_token = end_token
 
+    _check_seams_are_request_aligned(ubatch_slices, cu_num_tokens)
+
     ubatch_slices_padded = _pad_out_ubatch_slices(
         ubatch_slices, num_tokens_padded, num_reqs_padded
     )
@@ -112,6 +115,46 @@ def maybe_create_ubatch_slices(
     assert sum(s.num_tokens for s in ubatch_slices_padded) == num_tokens_padded
 
     return ubatch_slices, ubatch_slices_padded
+
+
+def _check_seams_are_request_aligned(
+    ubatch_slices: UBatchSlices, cu_num_tokens: np.ndarray
+) -> None:
+    """Refuse a seam that falls inside a request.
+
+    The split point above is the midpoint of the padded token count and knows
+    nothing about where requests begin and end, so a pass holding one long
+    prefill is always cut in half. Measured on Qwen3-30B-A3B across four ranks,
+    such a pass scores normally before the seam and near-uniform noise after it
+    -- 2.07 nats before, 10.42 after, against 11.9 for a uniform distribution
+    over the vocabulary -- while passes in the same run whose seam landed on a
+    request boundary matched the unmicrobatched arm to within 0.009 nats. The
+    same damage appears with the all-to-all served over NCCL instead of the
+    copy-engine transport, so it is not a property of any one backend.
+
+    Nothing downstream notices: the output has the right shape, the run is
+    merely wrong, and it is faster for being wrong, which is how a throughput
+    result came to be measured on it. Until the underlying defect is found this
+    refuses to produce that configuration. Set
+    VLLM_DBO_ALLOW_INTRA_REQUEST_SEAMS=1 to proceed anyway.
+    """
+
+    if os.environ.get("VLLM_DBO_ALLOW_INTRA_REQUEST_SEAMS") == "1":
+        return
+
+    edges = set(int(v) for v in cu_num_tokens)
+    for ubatch_slice in ubatch_slices[1:]:
+        seam = int(ubatch_slice.token_slice.start)
+        if seam not in edges:
+            raise ValueError(
+                f"microbatch seam at token {seam} falls inside a request "
+                f"(request boundaries are at {sorted(edges)}). Splitting one "
+                "request's prefill across two microbatches corrupts every "
+                "token after the seam. Give the pass more than one request, "
+                "raise dbo_prefill_token_threshold so it is not split, or set "
+                "VLLM_DBO_ALLOW_INTRA_REQUEST_SEAMS=1 if you are debugging "
+                "this path."
+            )
 
 
 def slice_query_start_locs(

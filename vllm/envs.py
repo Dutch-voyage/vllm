@@ -206,9 +206,11 @@ if TYPE_CHECKING:
     VLLM_CE_A2A_CONTROL_RING_DEPTH: int = 128
     VLLM_CE_A2A_PROXY_CPU: int = -1
     VLLM_CE_A2A_PROXY_CPU_MAP: str = ""
+    VLLM_CE_A2A_WORKER_CPU_MAP: str = ""
     VLLM_CE_A2A_PROXY_WINDOW: int = 1
     VLLM_CE_A2A_PHASE_TIMING: bool = False
     VLLM_CE_A2A_ENQUEUE_ONLY_WAIT: bool = False
+    VLLM_CE_A2A_ASYNC: bool = True
     VLLM_CE_A2A_SCHEDULER: Literal[
         "edge_credits",
         "edge_stream_memops",
@@ -1607,6 +1609,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_CE_A2A_PROXY_CPU_MAP": lambda: os.getenv(
         "VLLM_CE_A2A_PROXY_CPU_MAP", ""
     ),
+    "VLLM_CE_A2A_WORKER_CPU_MAP": lambda: os.getenv(
+        "VLLM_CE_A2A_WORKER_CPU_MAP", ""
+    ),
     "VLLM_CE_A2A_PROXY_WINDOW": lambda: int(
         os.getenv("VLLM_CE_A2A_PROXY_WINDOW", "1")
     ),
@@ -1615,6 +1620,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_CE_A2A_ENQUEUE_ONLY_WAIT": lambda: bool(
         int(os.getenv("VLLM_CE_A2A_ENQUEUE_ONLY_WAIT", "0"))
+    ),
+    "VLLM_CE_A2A_ASYNC": lambda: bool(
+        int(os.getenv("VLLM_CE_A2A_ASYNC", "1"))
     ),
     "VLLM_CE_A2A_SCHEDULER": env_with_choices(
         "VLLM_CE_A2A_SCHEDULER",

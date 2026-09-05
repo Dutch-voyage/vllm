@@ -1264,6 +1264,35 @@ class GroupCoordinator:
         else:
             return hidden_states
 
+    def supports_dispatch_combine_async(self) -> bool:
+        return (
+            self.device_communicator is not None
+            and self.device_communicator.supports_dispatch_combine_async()
+        )
+
+    def dispatch_async(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        is_sequence_parallel: bool = False,
+        extra_tensors: list[torch.Tensor] | None = None,
+    ):
+        assert self.device_communicator is not None
+        return self.device_communicator.dispatch_async(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            is_sequence_parallel,
+            extra_tensors,
+        )
+
+    def combine_async(self, hidden_states, is_sequence_parallel: bool = False):
+        assert self.device_communicator is not None
+        return self.device_communicator.combine_async(
+            hidden_states, is_sequence_parallel
+        )
+
 
 _WORLD: GroupCoordinator | None = None
 _INNER_DP_WORLD: GroupCoordinator | None = None

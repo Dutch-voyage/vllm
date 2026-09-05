@@ -2402,12 +2402,22 @@ class EngineArgs:
 
     def _check_feature_supported(self):
         """Raise an error if the feature is not supported."""
-        # No Concurrent Partial Prefills so far.
-        if (
+        concurrent_partial_prefills = (
             self.max_num_partial_prefills != SchedulerConfig.max_num_partial_prefills
             or self.max_long_partial_prefills
             != SchedulerConfig.max_long_partial_prefills
-        ):
+        )
+        # Request-aligned DBO needs the scheduler to admit more than one long
+        # prefill so that microbatch seams can fall between requests. Keep the
+        # upstream restriction everywhere except the explicit CE/DBO path, and
+        # require every admitted partial prefill to be eligible as a long one.
+        ce_dbo_request_aligned = (
+            self.enable_dbo
+            and self.all2all_backend == "ce_a2a"
+            and self.max_num_partial_prefills > 1
+            and self.max_long_partial_prefills == self.max_num_partial_prefills
+        )
+        if concurrent_partial_prefills and not ce_dbo_request_aligned:
             _raise_unsupported_error(feature_name="Concurrent Partial Prefill")
 
         if self.pipeline_parallel_size > 1:

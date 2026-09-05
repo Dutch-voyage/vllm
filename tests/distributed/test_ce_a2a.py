@@ -18,6 +18,7 @@ from vllm.distributed.device_communicators.ce_a2a import (
     _solve_max_edge_dispatch_plan,
     _to_ce_wire,
     _value_row_bytes,
+    _worker_cpu_for_rank,
 )
 
 
@@ -292,6 +293,26 @@ def test_proxy_cpu_map_is_topology_aware_unique_and_exact() -> None:
         _proxy_cpu_for_rank(20, 0, 4, "20,20,21,22")
 
 
+def test_worker_cpu_map_is_optional_unique_and_exact() -> None:
+    mapping = "8,9,10,11,36,37,38,39"
+
+    assert [_worker_cpu_for_rank(rank, 8, mapping) for rank in range(8)] == [
+        8,
+        9,
+        10,
+        11,
+        36,
+        37,
+        38,
+        39,
+    ]
+    assert _worker_cpu_for_rank(0, 8, "") is None
+    with pytest.raises(ValueError, match="exactly one CPU per rank"):
+        _worker_cpu_for_rank(0, 8, "8,9")
+    with pytest.raises(ValueError, match="unique and nonnegative"):
+        _worker_cpu_for_rank(0, 4, "8,8,9,10")
+
+
 def test_ce_observability_environment_is_registered(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -299,12 +320,17 @@ def test_ce_observability_environment_is_registered(
 
     monkeypatch.setenv("VLLM_CE_A2A_PHASE_TIMING", "1")
     monkeypatch.setenv("VLLM_CE_A2A_ENQUEUE_ONLY_WAIT", "1")
+    monkeypatch.setenv("VLLM_CE_A2A_WORKER_CPU_MAP", "8,9,10,11")
     monkeypatch.setenv(
         "VLLM_CE_A2A_EDGE_SCHEDULE", "ep8_dual_numa_adaptive_v1"
     )
 
     assert envs.environment_variables["VLLM_CE_A2A_PHASE_TIMING"]() is True
     assert envs.environment_variables["VLLM_CE_A2A_ENQUEUE_ONLY_WAIT"]() is True
+    assert (
+        envs.environment_variables["VLLM_CE_A2A_WORKER_CPU_MAP"]()
+        == "8,9,10,11"
+    )
     assert (
         envs.environment_variables["VLLM_CE_A2A_EDGE_SCHEDULE"]()
         == "ep8_dual_numa_adaptive_v1"

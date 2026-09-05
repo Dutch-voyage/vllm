@@ -322,11 +322,19 @@ def test_split_decodes_and_prefills_uniform_padded_batch_all_same():
     ],
 )
 def test_prefill_split_across_ubatches(
-    seq_lens, query_lens, split_point, expected_first_reqs, expected_second_reqs
+    seq_lens,
+    query_lens,
+    split_point,
+    expected_first_reqs,
+    expected_second_reqs,
+    monkeypatch,
 ):
     """Test splitting a prefill across ubatches"""
     import numpy as np
 
+    # This test exercises vLLM's legacy intra-request slicing mechanics. PACE
+    # rejects that mode by default because it is not accuracy-safe.
+    monkeypatch.setenv("VLLM_DBO_ALLOW_INTRA_REQUEST_SEAMS", "1")
     device = torch.device("cpu")
     batch_spec = BatchSpec(seq_lens=seq_lens, query_lens=query_lens)
     common = create_common_attn_metadata(batch_spec, block_size=16, device=device)

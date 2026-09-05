@@ -187,6 +187,22 @@ def dbo_register_recv_hook(recv_hook):
     if len(_THREAD_ID_TO_CONTEXT) > 0:
         ctx_idx = _THREAD_ID_TO_CONTEXT[threading.get_ident()]
         next_ctx = _CURRENT_CONTEXTS[(ctx_idx + 1) % _NUM_UBATCHES]
+        if next_ctx.recv_hook is not None:
+            # A context holds one deferred wait, so overwriting one discards
+            # the only ordering between a transfer and the kernel that reads
+            # what it delivers. Nothing downstream can notice: the tensors are
+            # the right shape and the run is merely wrong, and faster for
+            # being wrong. Registration and drain have to balance -- backends
+            # drain at the top of prepare and again in finalize -- so an
+            # occupied slot is always a backend that registered without
+            # draining, and is worth refusing to run.
+            raise RuntimeError(
+                f"microbatch {next_ctx.id} still holds an unrun receive hook: "
+                "the prepare/finalize backend registered a deferred wait "
+                "without draining the previous one. Every registration needs "
+                "a matching dbo_maybe_run_recv_hook(); see the drain in "
+                "deepep_ll._finalize."
+            )
         next_ctx.recv_hook = recv_hook
 
 

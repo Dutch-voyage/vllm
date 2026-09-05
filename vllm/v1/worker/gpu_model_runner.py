@@ -216,7 +216,10 @@ from vllm.v1.worker.cp_utils import (
     get_dcp_dummy_context_len,
     prepare_dcp_dummy_context_metadata,
 )
-from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
+from vllm.v1.worker.dp_utils import (
+    coordinate_batch_and_moe_phase_across_dp,
+    coordinate_batch_across_dp,
+)
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu.attn_utils import _reshape_attention_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -2445,7 +2448,8 @@ class GPUModelRunner(
         # can cache the attention metadata builds and just update the block table using
         # `builder.update_block_table` if the builder supports it.
         cached_attn_metadata: dict[
-            tuple[KVCacheSpec, type[AttentionMetadataBuilder]], AttentionMetadata
+            tuple[KVCacheSpec, type[AttentionMetadataBuilder], int | None],
+            AttentionMetadata,
         ] = {}
 
         def _build_attn_group_metadata(
@@ -2459,7 +2463,10 @@ class GPUModelRunner(
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
-            cache_key = (kv_cache_spec, type(builder))
+            # Ubatch slices have different query/sequence lengths. Reuse is
+            # valid across equivalent hybrid KV-cache groups, but not across
+            # ubatches where update_block_table only replaces table/slot data.
+            cache_key = (kv_cache_spec, type(builder), ubid)
 
             cascade_attn_prefix_len = (
                 cascade_attn_prefix_lens[kv_cache_gid][attn_gid]
@@ -3889,6 +3896,7 @@ class GPUModelRunner(
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        moe_attention_phase: str | None = None,
     ) -> tuple[
         CUDAGraphMode,
         BatchDescriptor,
@@ -3896,6 +3904,16 @@ class GPUModelRunner(
         torch.Tensor | None,
         CUDAGraphStat | None,
     ]:
+        pace_phase_sync = (
+            self.parallel_config.data_parallel_size > 1
+            and self.parallel_config.all2all_backend == "ce_a2a"
+            and envs.VLLM_CE_A2A_PREFILL_ONLY
+        )
+        if pace_phase_sync and moe_attention_phase is None:
+            # Empty DP ranks execute a dummy model step so that their existing
+            # batch-coordination collective stays ordered with active ranks.
+            # Give those steps an explicit ineligible phase in the same tensor.
+            moe_attention_phase = "idle"
         uniform_decode = self._is_uniform_decode(
             max_num_scheduled_tokens=max_num_scheduled_tokens,
             uniform_decode_query_len=self.uniform_decode_query_len,
@@ -3946,17 +3964,34 @@ class GPUModelRunner(
         # Extra coordination when running data-parallel since we need to coordinate
         # across ranks
         should_ubatch, num_tokens_across_dp = False, None
+        self._coordinated_moe_attention_phase = moe_attention_phase
         if self.vllm_config.parallel_config.data_parallel_size > 1:
-            should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
-                coordinate_batch_across_dp(
+            if moe_attention_phase is None:
+                should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
+                    coordinate_batch_across_dp(
+                        num_tokens_unpadded=num_tokens,
+                        parallel_config=self.parallel_config,
+                        allow_microbatching=allow_microbatching,
+                        num_tokens_padded=num_tokens_padded,
+                        uniform_decode=uniform_decode,
+                        cudagraph_mode=cudagraph_mode.value,
+                    )
+                )
+            else:
+                (
+                    should_ubatch,
+                    num_tokens_across_dp,
+                    synced_cudagraph_mode,
+                    self._coordinated_moe_attention_phase,
+                ) = coordinate_batch_and_moe_phase_across_dp(
                     num_tokens_unpadded=num_tokens,
                     parallel_config=self.parallel_config,
                     allow_microbatching=allow_microbatching,
+                    moe_attention_phase=moe_attention_phase,
                     num_tokens_padded=num_tokens_padded,
                     uniform_decode=uniform_decode,
                     cudagraph_mode=cudagraph_mode.value,
                 )
-            )
 
             # Extract DP-synced values
             if num_tokens_across_dp is not None:
@@ -4207,6 +4242,24 @@ class GPUModelRunner(
                     scheduler_output.num_common_prefix_blocks,
                 )
 
+            prefill_requests = (
+                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
+                < self.input_batch.num_prompt_tokens_cpu_tensor[:num_reqs]
+            )
+            if num_reqs == 0:
+                moe_attention_phase = "idle"
+            elif bool(prefill_requests.all()):
+                moe_attention_phase = "prefill"
+            elif bool(prefill_requests.any()):
+                moe_attention_phase = "mixed"
+            else:
+                moe_attention_phase = "decode"
+            coordinate_moe_phase = (
+                self.parallel_config.data_parallel_size > 1
+                and self.parallel_config.all2all_backend == "ce_a2a"
+                and envs.VLLM_CE_A2A_PREFILL_ONLY
+            )
+
             (
                 cudagraph_mode,
                 batch_desc,
@@ -4220,6 +4273,9 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                moe_attention_phase=(
+                    moe_attention_phase if coordinate_moe_phase else None
+                ),
             )
 
             logger.debug(
@@ -4373,18 +4429,9 @@ class GPUModelRunner(
                 num_tokens_unpadded,
                 ubatch_slices_padded,
             )
-        prefill_requests = (
-            self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
-            < self.input_batch.num_prompt_tokens_cpu_tensor[:num_reqs]
-        )
-        if num_reqs == 0:
-            moe_attention_phase = "idle"
-        elif bool(prefill_requests.all()):
-            moe_attention_phase = "prefill"
-        elif bool(prefill_requests.any()):
-            moe_attention_phase = "mixed"
-        else:
-            moe_attention_phase = "decode"
+        if coordinate_moe_phase:
+            assert self._coordinated_moe_attention_phase is not None
+            moe_attention_phase = self._coordinated_moe_attention_phase
 
         with (
             set_forward_context(

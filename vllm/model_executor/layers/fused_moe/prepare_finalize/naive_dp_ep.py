@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
+
 import torch
 
 import vllm.envs as envs
@@ -13,6 +15,11 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
+from vllm.v1.worker.ubatching import dbo_maybe_run_recv_hook
+
+
+def _no_wait(result):
+    return (lambda: None), (lambda: result)
 
 
 def _quantize_and_setup_dispatch(
@@ -159,6 +166,63 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
     ) -> mk.PrepareResultType:
         """Quantize and Dispatch Topk Weights and Topk Ids."""
 
+        hook, receiver = self._prepare(
+            a1,
+            topk_weights,
+            topk_ids,
+            num_experts,
+            expert_map,
+            apply_router_weight_on_input,
+            quant_config,
+            defer_input_quant=defer_input_quant,
+            do_async=False,
+        )
+        hook()
+        return receiver()
+
+    def supports_async(self) -> bool:
+        return (
+            not self._route_after_gather
+            and get_ep_group().supports_dispatch_combine_async()
+        )
+
+    def prepare_async(
+        self,
+        a1: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        num_experts: int,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        quant_config: FusedMoEQuantConfig,
+        defer_input_quant: bool = False,
+    ) -> tuple[Callable, mk.ReceiverType]:
+        return self._prepare(
+            a1,
+            topk_weights,
+            topk_ids,
+            num_experts,
+            expert_map,
+            apply_router_weight_on_input,
+            quant_config,
+            defer_input_quant=defer_input_quant,
+            do_async=True,
+        )
+
+    def _prepare(
+        self,
+        a1: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        num_experts: int,
+        expert_map: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        quant_config: FusedMoEQuantConfig,
+        defer_input_quant: bool,
+        do_async: bool,
+    ) -> tuple[Callable, mk.ReceiverType]:
+        """Quantize and start dispatch, optionally deferring its receive."""
+
         if apply_router_weight_on_input:
             topk = topk_ids.size(1)
             assert topk == 1, (
@@ -192,7 +256,9 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
             # The runner already gathered activations, then ran the replicated
             # router on those global rows. Dynamic activation scales, when
             # present, were therefore also computed from global rows here.
-            return a1q, a1q_scale_orig, None, topk_ids, topk_weights
+            return _no_wait(
+                (a1q, a1q_scale_orig, None, topk_ids, topk_weights)
+            )
 
         extra_tensors: list[torch.Tensor] | None = None
         if scales is not None:
@@ -202,34 +268,54 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
                 extra_tensors = []
             extra_tensors.append(local_token_lora_mapping)
 
-        res = get_ep_group().dispatch(
+        group = get_ep_group()
+        dispatch_args = (
             a1q,
             topk_weights,
             topk_ids,
-            is_sequence_parallel=self.is_sequence_parallel,
-            extra_tensors=extra_tensors,
         )
-
-        if extra_tensors is None:
-            assert len(res) == 3
-            a1q, topk_weights, topk_ids = res
-            a1q_scale = a1q_scale_orig
+        dispatch_kwargs = {
+            "is_sequence_parallel": self.is_sequence_parallel,
+            "extra_tensors": extra_tensors,
+        }
+        if do_async:
+            hook, receive_dispatch = group.dispatch_async(
+                *dispatch_args, **dispatch_kwargs
+            )
         else:
-            assert len(res) == 4
-            a1q, topk_weights, topk_ids, gathered_extras = res
-            gathered_extras = list(gathered_extras)
-            if local_token_lora_mapping is not None:
-                dispatched_lora_mapping = gathered_extras.pop()
-                assert lora_ctx is not None
-                lora_ctx.local_token_lora_mapping = dispatched_lora_mapping
-            if scales is not None:
-                a1q_scale = _unwrap_scale_and_prepare_for_moe(
-                    gathered_extras, quant_config
-                )
-            else:
-                a1q_scale = a1q_scale_orig
+            hook, receive_dispatch = _no_wait(
+                group.dispatch(*dispatch_args, **dispatch_kwargs)
+            )
 
-        return a1q, a1q_scale, None, topk_ids, topk_weights
+        def receiver() -> mk.PrepareResultType:
+            res = receive_dispatch()
+            if extra_tensors is None:
+                assert len(res) == 3
+                recv_a1q, recv_topk_weights, recv_topk_ids = res
+                recv_a1q_scale = a1q_scale_orig
+            else:
+                assert len(res) == 4
+                recv_a1q, recv_topk_weights, recv_topk_ids, gathered_extras = res
+                gathered_extras = list(gathered_extras)
+                if local_token_lora_mapping is not None:
+                    dispatched_lora_mapping = gathered_extras.pop()
+                    assert lora_ctx is not None
+                    lora_ctx.local_token_lora_mapping = dispatched_lora_mapping
+                if scales is not None:
+                    recv_a1q_scale = _unwrap_scale_and_prepare_for_moe(
+                        gathered_extras, quant_config
+                    )
+                else:
+                    recv_a1q_scale = a1q_scale_orig
+            return (
+                recv_a1q,
+                recv_a1q_scale,
+                None,
+                recv_topk_ids,
+                recv_topk_weights,
+            )
+
+        return hook, receiver
 
     def finalize(
         self,
@@ -240,6 +326,47 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         apply_router_weight_on_input: bool,
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
     ) -> None:
+        hook, receiver = self._finalize(
+            output,
+            fused_expert_output,
+            topk_weights,
+            topk_ids,
+            apply_router_weight_on_input,
+            weight_and_reduce_impl,
+            do_async=False,
+        )
+        hook()
+        receiver()
+
+    def finalize_async(
+        self,
+        output: torch.Tensor,
+        fused_expert_output: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        apply_router_weight_on_input: bool,
+        weight_and_reduce_impl: mk.TopKWeightAndReduce,
+    ) -> tuple[Callable, Callable]:
+        return self._finalize(
+            output,
+            fused_expert_output,
+            topk_weights,
+            topk_ids,
+            apply_router_weight_on_input,
+            weight_and_reduce_impl,
+            do_async=True,
+        )
+
+    def _finalize(
+        self,
+        output: torch.Tensor,
+        fused_expert_output: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        apply_router_weight_on_input: bool,
+        weight_and_reduce_impl: mk.TopKWeightAndReduce,
+        do_async: bool,
+    ) -> tuple[Callable, Callable]:
         if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
             weight_and_reduce_impl = TopKWeightAndReduceContiguous()
 
@@ -251,9 +378,20 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
-        output.copy_(
-            get_ep_group().combine(out, is_sequence_parallel=self.is_sequence_parallel)
-        )
+        # Drain the dispatch wait before starting combine. Under DBO this hook
+        # belongs to the other microbatch; omitting it can silently overwrite
+        # the only dependency protecting the receive buffer.
+        dbo_maybe_run_recv_hook()
+        group = get_ep_group()
+        if do_async:
+            hook, receive_combine = group.combine_async(
+                out, is_sequence_parallel=self.is_sequence_parallel
+            )
+        else:
+            hook, receive_combine = _no_wait(
+                group.combine(out, is_sequence_parallel=self.is_sequence_parallel)
+            )
+        return hook, lambda: output.copy_(receive_combine())
 
 
 class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMonolithic):

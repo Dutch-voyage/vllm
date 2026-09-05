@@ -745,6 +745,38 @@ class CudaCommunicator(DeviceCommunicatorBase):
             is_sequence_parallel,
         )
 
+    def supports_dispatch_combine_async(self) -> bool:
+        return (
+            self.all2all_manager is not None
+            and self.all2all_manager.supports_async()
+        )
+
+    def dispatch_async(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        is_sequence_parallel: bool = False,
+        extra_tensors: list[torch.Tensor] | None = None,
+    ):
+        assert self.all2all_manager is not None
+        return self.all2all_manager.dispatch_async(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            is_sequence_parallel,
+            extra_tensors=extra_tensors,
+        )
+
+    def combine_async(
+        self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
+    ):
+        assert self.all2all_manager is not None
+        return self.all2all_manager.combine_async(
+            hidden_states,
+            is_sequence_parallel,
+        )
+
     def batch_isend_irecv(self, p2p_ops: list):
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
