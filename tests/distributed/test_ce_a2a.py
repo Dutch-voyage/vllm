@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from types import SimpleNamespace
 
 import pytest
@@ -8,8 +9,8 @@ from vllm.distributed.device_communicators import ce_a2a as ce_a2a_module
 from vllm.distributed.device_communicators.ce_a2a import (
     CeA2AAll2AllManager,
     _attention_phase,
-    _codec_snapshot_settings,
     _codec_group_count,
+    _codec_snapshot_settings,
     _forward_phase,
     _from_ce_wire,
     _ladder_views,
@@ -21,6 +22,45 @@ from vllm.distributed.device_communicators.ce_a2a import (
     _value_row_bytes,
     _worker_cpu_for_rank,
 )
+
+
+@pytest.mark.parametrize("control_kind", ["native_proxy", "exact_nccl"])
+def test_packet_backend_defers_receive_dependency_to_returned_hook(
+    control_kind: str,
+) -> None:
+    events: list[object] = []
+
+    class Control:
+        def submit_async(self, *args, **kwargs):
+            events.append((args, kwargs))
+            return lambda: events.append("receive_dependency")
+
+        def submit(self, *args, **kwargs):
+            raise AssertionError("asynchronous packet submission was serialized")
+
+    manager = CeA2AAll2AllManager.__new__(CeA2AAll2AllManager)
+    manager.control = Control()
+    manager.control_kind = control_kind
+    manager._lane_id = 1
+    manager.async_split = True
+    packets = torch.zeros((2, 1, 4), dtype=torch.uint8)
+    counts = torch.ones(2, dtype=torch.int32)
+    widths = torch.full((2,), 4, dtype=torch.int32)
+
+    assert manager.supports_async()
+    hook = manager._launch_fixed_exchange(
+        0, packets, counts, packets, counts, widths, widths
+    )
+    assert len(events) == 1
+    assert isinstance(events[0], tuple)
+    args, kwargs = events[0]
+    assert args[0] == "dispatch" and args[1] is packets
+    assert args[5] is widths and args[6] is widths
+    assert kwargs == {"lane": 1}
+    hook()
+    assert events[-1] == "receive_dependency"
+    manager.async_split = False
+    assert not manager.supports_async()
 
 
 def test_codec_snapshot_settings_are_explicit_and_bounded(
@@ -255,9 +295,7 @@ def test_max_edge_plan_keeps_cross_rank_ties_int5_and_respects_budget(
         promoted, widths = _solve_max_edge_dispatch_plan(counts, spec, peak)
         assert promoted[counts.index(peak)] == 0
         assert any(
-            groups > 0
-            for count, groups in zip(counts, promoted)
-            if count < peak
+            groups > 0 for count, groups in zip(counts, promoted) if count < peak
         )
         for count, groups, width in zip(counts, promoted, widths):
             assert width == dispatch_ladder_packet_bytes(spec, groups)
@@ -374,18 +412,13 @@ def test_ce_observability_environment_is_registered(
     monkeypatch.setenv("VLLM_CE_A2A_PHASE_TIMING", "1")
     monkeypatch.setenv("VLLM_CE_A2A_ENQUEUE_ONLY_WAIT", "1")
     monkeypatch.setenv("VLLM_CE_A2A_WORKER_CPU_MAP", "8,9,10,11")
-    monkeypatch.setenv(
-        "VLLM_CE_A2A_EDGE_SCHEDULE", "ep8_dual_numa_adaptive_v1"
-    )
+    monkeypatch.setenv("VLLM_CE_A2A_EDGE_SCHEDULE", "ep8_dual_numa_adaptive_v1")
     monkeypatch.setenv("VLLM_CE_A2A_CODEC_SNAPSHOT_PREFIX", "/tmp/frozen")
     monkeypatch.setenv("VLLM_CE_A2A_CODEC_SNAPSHOT_CALL", "47")
 
     assert envs.environment_variables["VLLM_CE_A2A_PHASE_TIMING"]() is True
     assert envs.environment_variables["VLLM_CE_A2A_ENQUEUE_ONLY_WAIT"]() is True
-    assert (
-        envs.environment_variables["VLLM_CE_A2A_WORKER_CPU_MAP"]()
-        == "8,9,10,11"
-    )
+    assert envs.environment_variables["VLLM_CE_A2A_WORKER_CPU_MAP"]() == "8,9,10,11"
     assert (
         envs.environment_variables["VLLM_CE_A2A_EDGE_SCHEDULE"]()
         == "ep8_dual_numa_adaptive_v1"
@@ -437,9 +470,7 @@ def test_forward_phase_prefers_authoritative_runner_signal(
     phase: str | None,
     expected: str,
 ) -> None:
-    additional_kwargs = (
-        {} if phase is None else {"moe_attention_phase": phase}
-    )
+    additional_kwargs = {} if phase is None else {"moe_attention_phase": phase}
     context = SimpleNamespace(
         additional_kwargs=additional_kwargs,
         attn_metadata=None,
@@ -452,9 +483,7 @@ def test_forward_phase_prefers_authoritative_runner_signal(
 def test_forward_phase_classifies_missing_context_as_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        ce_a2a_module, "is_forward_context_available", lambda: False
-    )
+    monkeypatch.setattr(ce_a2a_module, "is_forward_context_available", lambda: False)
 
     assert _forward_phase() == "idle"
 
