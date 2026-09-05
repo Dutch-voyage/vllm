@@ -25,6 +25,69 @@ from vllm.distributed.device_communicators.ce_a2a import (
 
 
 @pytest.mark.parametrize("control_kind", ["native_proxy", "exact_nccl"])
+@pytest.mark.parametrize("combine_bits", [0, 6])
+def test_dbo_lane_receive_buffers_preserve_codec_sentinel_row(
+    monkeypatch: pytest.MonkeyPatch, control_kind: str, combine_bits: int
+) -> None:
+    """NCCL lanes need staging with the same sentinel geometry as lane zero."""
+    import ce_a2a_moe
+
+    monkeypatch.setattr(
+        torch.accelerator, "current_device_index", lambda: torch.device("cpu")
+    )
+    monkeypatch.setattr(
+        ce_a2a_moe, "FusedBlockDispatchBuilder", lambda **kwargs: object()
+    )
+    inbox_lanes = []
+
+    def inbox_view(inbox, *, dtype, row_elements, lane):
+        inbox_lanes.append(lane)
+        rows = 4 if control_kind == "native_proxy" else 3
+        return SimpleNamespace(local=torch.empty((2, rows, row_elements), dtype=dtype))
+
+    spec = ce_a2a_moe.DispatchPacketSpec(
+        hidden_size=128, top_k=2, activation_bits=6, group_size=128
+    )
+    manager = CeA2AAll2AllManager.__new__(CeA2AAll2AllManager)
+    manager.__dict__.update(
+        _owner=object(),
+        _lane_id=1,
+        control_kind=control_kind,
+        transport=SimpleNamespace(
+            _inbox_view=inbox_view, dispatch_inbox=object(), combine_inbox=object()
+        ),
+        packet_spec=spec,
+        packet_builder_kind="fused",
+        world_size=2,
+        max_edge_rows=3,
+        experts_per_rank=2,
+        dispatch_bits=6,
+        combine_bits=combine_bits,
+        dispatch_row_bytes=spec.packet_bytes,
+        combine_row_bytes=(
+            ce_a2a_moe.lowbit_block_payload_bytes(128, combine_bits, 128)
+            if combine_bits
+            else 256
+        ),
+        width_balance=False,
+        delta_max_edge=False,
+        delta_dispatch=False,
+        combine_fill=False,
+        combine_ladder_g=0,
+        edge_schedule="cyclic",
+    )
+
+    manager._allocate_lane_exchange_state(128, 2, torch.bfloat16)
+
+    assert manager.dispatch_recv_blocks.shape == (2, 4, spec.packet_bytes)
+    assert manager.fixed_recv_hidden.shape == (8, 128)
+    assert manager.fixed_recv_ids.shape == manager.fixed_recv_weights.shape == (8, 2)
+    return_width = manager.combine_row_bytes if combine_bits else 128
+    assert manager.combine_recv_blocks.shape == (2, 4, return_width)
+    assert inbox_lanes == ([1, 1] if control_kind == "native_proxy" else [])
+
+
+@pytest.mark.parametrize("control_kind", ["native_proxy", "exact_nccl"])
 def test_packet_backend_defers_receive_dependency_to_returned_hook(
     control_kind: str,
 ) -> None:

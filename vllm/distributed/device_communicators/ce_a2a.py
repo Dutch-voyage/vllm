@@ -1709,12 +1709,21 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             )
             self.fill_count_recv = torch.empty_like(self.fill_count_send)
 
-        self.dispatch_recv_blocks = self.transport._inbox_view(
-            self.transport.dispatch_inbox,
-            dtype=torch.uint8,
-            row_elements=self.dispatch_row_bytes,
-            lane=self._lane_id,
-        ).local
+        direct_inbox_receive = self.control_kind == "native_proxy"
+        self.dispatch_recv_blocks = (
+            self.transport._inbox_view(
+                self.transport.dispatch_inbox,
+                dtype=torch.uint8,
+                row_elements=self.dispatch_row_bytes,
+                lane=self._lane_id,
+            ).local
+            if direct_inbox_receive
+            else torch.empty(
+                (self.world_size, block_rows, self.dispatch_row_bytes),
+                dtype=torch.uint8,
+                device=device,
+            )
+        )
         if not self.dispatch_recv_blocks.is_contiguous():
             raise RuntimeError("direct dispatch inbox must be contiguous")
         self.dispatch_ladder = None
@@ -1743,12 +1752,16 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 dtype=torch.uint8,
                 device=device,
             )
-            self.combine_recv_blocks = self.transport._inbox_view(
-                self.transport.combine_inbox,
-                dtype=torch.uint8,
-                row_elements=self.combine_row_bytes,
-                lane=self._lane_id,
-            ).local
+            self.combine_recv_blocks = (
+                self.transport._inbox_view(
+                    self.transport.combine_inbox,
+                    dtype=torch.uint8,
+                    row_elements=self.combine_row_bytes,
+                    lane=self._lane_id,
+                ).local
+                if direct_inbox_receive
+                else torch.empty_like(self.combine_send_blocks)
+            )
             if not self.combine_recv_blocks.is_contiguous():
                 raise RuntimeError("direct combine inbox must be contiguous")
             if self.combine_ladder_g:
@@ -1780,12 +1793,20 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     ) - _group_bytes(self.codec_group_size, self.combine_bits)
                     self.combine_groups = hidden_size // self.codec_group_size
         else:
-            self.combine_recv_blocks = self.transport._inbox_view(
-                self.transport.combine_inbox,
-                dtype=combine_wire_dtype,
-                row_elements=hidden_size,
-                lane=self._lane_id,
-            ).local
+            self.combine_recv_blocks = (
+                self.transport._inbox_view(
+                    self.transport.combine_inbox,
+                    dtype=combine_wire_dtype,
+                    row_elements=hidden_size,
+                    lane=self._lane_id,
+                ).local
+                if direct_inbox_receive
+                else torch.empty(
+                    (self.world_size, block_rows, hidden_size),
+                    dtype=combine_wire_dtype,
+                    device=device,
+                )
+            )
             if not self.combine_recv_blocks.is_contiguous():
                 raise RuntimeError("direct combine inbox must be contiguous")
 
