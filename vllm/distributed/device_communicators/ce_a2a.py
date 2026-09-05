@@ -58,6 +58,14 @@ def _already_done(
     return lambda: None, lambda: result
 
 
+def _codec_snapshot_settings() -> tuple[str, int]:
+    prefix = os.environ.get("VLLM_CE_A2A_CODEC_SNAPSHOT_PREFIX", "").strip()
+    call = int(os.environ.get("VLLM_CE_A2A_CODEC_SNAPSHOT_CALL", "47") or 47)
+    if call < 0:
+        raise ValueError("VLLM_CE_A2A_CODEC_SNAPSHOT_CALL must be nonnegative")
+    return prefix, call
+
+
 def _ce_a2a_exchange(
     send: torch.Tensor,
     send_counts: torch.Tensor,
@@ -682,6 +690,10 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         )
         self.delta_span_ratio: list[float] = []
         self._probe_state: tuple = ()
+        self.codec_snapshot_prefix, self.codec_snapshot_call = (
+            _codec_snapshot_settings()
+        )
+        self.codec_snapshot_written = False
         self.async_split = envs.VLLM_CE_A2A_ASYNC
         skew_log = os.environ.get("VLLM_CE_A2A_SKEW_LOG", "").strip()
         self.skew_recorder = (
@@ -790,6 +802,12 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     "width balance is a distinct arm; disable DELTA_MAX_EDGE and "
                     "COMBINE_FILL"
                 )
+        if self.codec_snapshot_prefix and not (
+            self.width_balance and self.delta_dispatch
+        ):
+            raise ValueError(
+                "codec snapshots require delta dispatch with width balance"
+            )
         self.pace_policy = _pace_policy_name(
             self.dispatch_bits,
             self.combine_bits,
@@ -2369,6 +2387,18 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         dispatch_recv_row_bytes,
                         lane=self._lane_id,
                     )
+                if (
+                    self.codec_snapshot_prefix
+                    and not self.codec_snapshot_written
+                    and self.ce_dispatch_calls == self.codec_snapshot_call
+                ):
+                    self._write_codec_snapshot(
+                        hidden_states,
+                        topk_ids,
+                        topk_weights,
+                        coalesced.send_counts,
+                        global_count_matrix,
+                    )
                 with self._timed_phase("dispatch_pack"):
                     coalesced = self.packet_builder.pack_prepared_multirung(
                         hidden_states,
@@ -3143,6 +3173,51 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 flush=True,
             )
 
+    def _write_codec_snapshot(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        send_counts: torch.Tensor,
+        global_count_matrix: torch.Tensor,
+    ) -> None:
+        """Persist one real delta state for an offline paired codec replay."""
+
+        from pathlib import Path
+
+        assert self.packet_builder is not None
+        assert self.packet_builder.reference is not None
+        assert self.dispatch_width_quanta is not None
+        rows = int(hidden_states.shape[0])
+        path = Path(f"{self.codec_snapshot_prefix}.rank{self.rank}.pt")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        payload = {
+            "schema": "vllm.ce-a2a-dispatch-codec-snapshot.v1",
+            "rank": self.rank,
+            "world_size": self.world_size,
+            "call_index": self.ce_dispatch_calls,
+            "hidden_size": int(hidden_states.shape[1]),
+            "top_k": int(topk_ids.shape[1]),
+            "group_size": self.codec_group_size,
+            "minimum_bits": self.width_balance_min_bits,
+            "maximum_bits": self.width_balance_max_bits,
+            "experts_per_rank": self.experts_per_rank,
+            "delta_margin": self.delta_margin,
+            "hidden_states": hidden_states.detach().cpu(),
+            "topk_ids": topk_ids.detach().cpu(),
+            "topk_weights": topk_weights.detach().cpu(),
+            "send_counts": send_counts.detach().cpu(),
+            "global_count_matrix": global_count_matrix.detach().cpu(),
+            "runtime_bit_quanta": self.dispatch_width_quanta.detach().cpu(),
+            "delta_reference": self.packet_builder.reference[
+                :, :rows
+            ].detach().cpu(),
+        }
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+        self.codec_snapshot_written = True
+
     def diagnostics(self) -> dict[str, Any]:
         device_wire_bytes = (
             (0, 0)
@@ -3403,6 +3478,11 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             "layer_calls_mod_stack": (
                 self.layer_calls % self.moe_layers if self.moe_layers else None
             ),
+            "codec_snapshot": {
+                "prefix": self.codec_snapshot_prefix or None,
+                "call": self.codec_snapshot_call,
+                "written": self.codec_snapshot_written,
+            },
         }
         if self.transport is not None:
             result["transport"] = self.transport.diagnostics()

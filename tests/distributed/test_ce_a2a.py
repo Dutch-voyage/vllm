@@ -8,6 +8,7 @@ from vllm.distributed.device_communicators import ce_a2a as ce_a2a_module
 from vllm.distributed.device_communicators.ce_a2a import (
     CeA2AAll2AllManager,
     _attention_phase,
+    _codec_snapshot_settings,
     _codec_group_count,
     _forward_phase,
     _from_ce_wire,
@@ -20,6 +21,58 @@ from vllm.distributed.device_communicators.ce_a2a import (
     _value_row_bytes,
     _worker_cpu_for_rank,
 )
+
+
+def test_codec_snapshot_settings_are_explicit_and_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_CE_A2A_CODEC_SNAPSHOT_PREFIX", " /tmp/snapshot ")
+    monkeypatch.setenv("VLLM_CE_A2A_CODEC_SNAPSHOT_CALL", "23")
+    assert _codec_snapshot_settings() == ("/tmp/snapshot", 23)
+
+    monkeypatch.setenv("VLLM_CE_A2A_CODEC_SNAPSHOT_CALL", "-1")
+    with pytest.raises(ValueError, match="must be nonnegative"):
+        _codec_snapshot_settings()
+
+
+def test_codec_snapshot_writes_frozen_inputs_and_reference(tmp_path) -> None:
+    manager = CeA2AAll2AllManager.__new__(CeA2AAll2AllManager)
+    manager.rank = 1
+    manager.world_size = 2
+    manager.ce_dispatch_calls = 7
+    manager.codec_group_size = 4
+    manager.width_balance_min_bits = 4
+    manager.width_balance_max_bits = 8
+    manager.experts_per_rank = 2
+    manager.delta_margin = 0.7
+    manager.codec_snapshot_prefix = str(tmp_path / "frozen")
+    manager.codec_snapshot_written = False
+    manager.packet_builder = SimpleNamespace(
+        reference=torch.arange(48, dtype=torch.float16).reshape(2, 3, 8)
+    )
+    manager.dispatch_width_quanta = torch.tensor(
+        [[32, 36], [40, 44]], dtype=torch.int32
+    )
+    hidden = torch.arange(16, dtype=torch.float16).reshape(2, 8)
+    ids = torch.tensor([[0, 2], [1, 3]], dtype=torch.int32)
+    weights = torch.full((2, 2), 0.5, dtype=torch.float32)
+    counts = torch.tensor([1, 2], dtype=torch.int32)
+    matrix = torch.tensor([[1, 1], [1, 2]], dtype=torch.int32)
+
+    manager._write_codec_snapshot(hidden, ids, weights, counts, matrix)
+
+    snapshot = torch.load(
+        tmp_path / "frozen.rank1.pt", map_location="cpu", weights_only=False
+    )
+    assert snapshot["schema"] == "vllm.ce-a2a-dispatch-codec-snapshot.v1"
+    assert snapshot["rank"] == 1
+    assert snapshot["call_index"] == 7
+    assert torch.equal(snapshot["hidden_states"], hidden)
+    assert torch.equal(snapshot["global_count_matrix"], matrix)
+    assert torch.equal(
+        snapshot["delta_reference"], manager.packet_builder.reference[:, :2]
+    )
+    assert manager.codec_snapshot_written is True
 
 
 def test_gptoss_group64_codec_layout() -> None:
