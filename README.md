@@ -1,3 +1,5 @@
+> **EdgeWeave experiment branch:** see [source pins and reproduction guidance](EDGEWEAVE_REPRODUCE.md), then follow the [PACE result-by-result guide](https://github.com/Dutch-voyage/PACE/blob/main/reproduction/README.md).
+
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
   <picture>
