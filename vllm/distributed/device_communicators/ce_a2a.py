@@ -557,7 +557,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             "device_proxy",
             "native_proxy",
             "graph_proxy",
-            "exact_nccl",
+            "exact_nccl", "direct_nccl",
         ):
             raise ValueError(
                 "VLLM_CE_A2A_CONTROL must be host_sync, device_proxy, or "
@@ -654,7 +654,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             raise ValueError("DELTA_MAX_EDGE implements the locked INT5-to-INT6 arm")
         if self.delta_max_edge and self.control_kind not in (
             "native_proxy",
-            "exact_nccl",
+            "exact_nccl", "direct_nccl",
         ):
             raise ValueError(
                 "DELTA_MAX_EDGE uses per-edge row widths and needs native_proxy "
@@ -756,8 +756,8 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 raise ValueError("width balance currently supports EP4 or EP8")
             if self.packet_builder_kind != "fused":
                 raise ValueError("width balance requires the fused packet builder")
-            if self.control_kind != "native_proxy":
-                raise ValueError("width balance requires native_proxy control")
+            if self.control_kind not in ("native_proxy", "direct_nccl", "exact_nccl"):
+                raise ValueError("width balance requires native_proxy or NCCL packet control")
             if self.scheduler != "edge_stream_memops":
                 raise ValueError("width balance requires edge_stream_memops")
             expected_schedule = (
@@ -1537,6 +1537,9 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             )
             if self.control_kind == "graph_proxy":
                 self.control = GraphP2PA2AScheduler(self.transport)
+            elif self.control_kind == "direct_nccl":
+                from ce_a2a_moe.direct_nccl import DirectSlotNcclPacketScheduler
+                self.control = DirectSlotNcclPacketScheduler(process_group=self.device_group)
             elif self.control_kind == "exact_nccl":
                 self.control = ExactNcclPacketScheduler(process_group=self.device_group)
             else:
@@ -1889,7 +1892,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             submit_options["global_count_matrix_transposed"] = (
                 global_count_matrix_transposed
             )
-        if self.control_kind not in ("native_proxy", "exact_nccl"):
+        if self.control_kind not in ("native_proxy", "exact_nccl", "direct_nccl"):
             submit_args = (
                 "dispatch" if phase == 0 else "combine",
                 send,
@@ -1919,7 +1922,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 **submit_options,
             )
         # Only controls with a per-edge width ABI may carry adaptive packets.
-        if self.control_kind not in ("native_proxy", "exact_nccl"):
+        if self.control_kind not in ("native_proxy", "exact_nccl", "direct_nccl"):
             raise RuntimeError(
                 "variable-width PACE needs VLLM_CE_A2A_CONTROL=native_proxy "
                 f"or exact_nccl, "
@@ -2001,7 +2004,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         return receiver()
 
     def supports_async(self) -> bool:
-        return self.async_split and self.control_kind in ("native_proxy", "exact_nccl")
+        return self.async_split and self.control_kind in ("native_proxy", "exact_nccl", "direct_nccl")
 
     def dispatch_async(
         self,
