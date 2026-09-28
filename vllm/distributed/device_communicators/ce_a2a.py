@@ -577,6 +577,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self.prefill_only = envs.VLLM_CE_A2A_PREFILL_ONLY
         self.width_balance_min_bits = int(envs.VLLM_CE_A2A_WIDTH_BALANCE_MIN_BITS)
         self.width_balance_max_bits = int(envs.VLLM_CE_A2A_WIDTH_BALANCE_MAX_BITS)
+        self.multirung_fixed6 = os.environ.get("VLLM_CE_A2A_MULTIRUNG_FIXED6", "0") == "1"
         self.width_balance = bool(
             self.width_balance_min_bits or self.width_balance_max_bits
         )
@@ -796,6 +797,10 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 f"balanced_{dispatch_mode}_{self.width_balance_min_bits}to"
                 f"{self.width_balance_max_bits}"
             )
+        if self.multirung_fixed6:
+            if not self.width_balance or self.delta_dispatch or (self.width_balance_min_bits, self.width_balance_max_bits) != (4, 8):
+                raise ValueError("fixed6 descriptors require direct multirung 4--8 codec")
+            self.pace_policy = "uniform_multirung_int6"
         # Layers run in a fixed order, so counting entries into dispatch -- both
         # the admitted ones and the ones that fall back -- recovers the index.
         self.layer_calls = 0
@@ -2258,8 +2263,8 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         hidden_size=hidden_size,
                         group_size=self.codec_group_size,
                         baseline_bits=6,
-                        minimum_bits=self.width_balance_min_bits,
-                        maximum_bits=self.width_balance_max_bits,
+                        minimum_bits=6 if self.multirung_fixed6 else self.width_balance_min_bits,
+                        maximum_bits=6 if self.multirung_fixed6 else self.width_balance_max_bits,
                         bit_quanta=self.dispatch_width_quanta,
                         row_bytes=self.dispatch_width_row_bytes,
                         accounting=self.dispatch_width_accounting,
@@ -2270,8 +2275,8 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                         hidden_size=hidden_size,
                         group_size=self.codec_group_size,
                         baseline_bits=6,
-                        minimum_bits=self.width_balance_min_bits,
-                        maximum_bits=self.width_balance_max_bits,
+                        minimum_bits=6 if self.multirung_fixed6 else self.width_balance_min_bits,
+                        maximum_bits=6 if self.multirung_fixed6 else self.width_balance_max_bits,
                         bit_quanta=self.combine_width_quanta,
                         row_bytes=self.combine_width_row_bytes,
                         accounting=self.combine_width_accounting,
@@ -3237,6 +3242,8 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             "dispatch_delta": self.delta_dispatch,
             "dispatch_delta_max_edge": self.delta_max_edge,
             "pace_policy": self.pace_policy,
+            "multirung_fixed6": self.multirung_fixed6,
+            "codec_implementation": "multirung_4to8" if self.width_balance else "fixed",
             "adaptive_dispatch_fallbacks": dict(self.adaptive_dispatch_fallbacks),
             "dispatch_delta_margin": self.delta_margin,
             "delta_span_ratio": self.delta_span_ratio,
