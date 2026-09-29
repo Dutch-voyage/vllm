@@ -610,9 +610,12 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 raise ValueError(f"unsupported CE edge schedule {self.edge_schedule!r}")
             if self.world_size != 8:
                 raise ValueError("adaptive dual-NUMA scheduling requires EP8")
-            if self.control_kind != "native_proxy":
+            if self.control_kind != "native_proxy" and not (
+                self.control_kind == "direct_nccl"
+                and self.edge_schedule == "ep8_dual_numa_phase_balanced_v1"
+            ):
                 raise ValueError(
-                    "topology edge scheduling requires native_proxy control"
+                    "topology edge scheduling requires native_proxy or direct_nccl"
                 )
             if self.scheduler != "edge_stream_memops":
                 raise ValueError("topology edge scheduling requires edge_stream_memops")
