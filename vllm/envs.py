@@ -1599,7 +1599,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "device_proxy",
             "native_proxy",
             "graph_proxy",
-            "exact_nccl", "direct_nccl",
+            "exact_nccl", "direct_nccl", "shared_geometry_nccl",
         ],
     ),
     "VLLM_CE_A2A_CONTROL_RING_DEPTH": lambda: int(

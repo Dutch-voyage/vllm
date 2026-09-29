@@ -557,7 +557,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             "device_proxy",
             "native_proxy",
             "graph_proxy",
-            "exact_nccl", "direct_nccl",
+            "exact_nccl", "direct_nccl", "shared_geometry_nccl",
         ):
             raise ValueError(
                 "VLLM_CE_A2A_CONTROL must be host_sync, device_proxy, or "
@@ -611,7 +611,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             if self.world_size != 8:
                 raise ValueError("adaptive dual-NUMA scheduling requires EP8")
             if self.control_kind != "native_proxy" and not (
-                self.control_kind == "direct_nccl"
+                self.control_kind in ("direct_nccl", "shared_geometry_nccl")
                 and self.edge_schedule == "ep8_dual_numa_phase_balanced_v1"
             ):
                 raise ValueError(
@@ -658,7 +658,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             raise ValueError("DELTA_MAX_EDGE implements the locked INT5-to-INT6 arm")
         if self.delta_max_edge and self.control_kind not in (
             "native_proxy",
-            "exact_nccl", "direct_nccl",
+            "exact_nccl", "direct_nccl", "shared_geometry_nccl",
         ):
             raise ValueError(
                 "DELTA_MAX_EDGE uses per-edge row widths and needs native_proxy "
@@ -760,7 +760,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 raise ValueError("width balance currently supports EP4 or EP8")
             if self.packet_builder_kind != "fused":
                 raise ValueError("width balance requires the fused packet builder")
-            if self.control_kind not in ("native_proxy", "direct_nccl", "exact_nccl"):
+            if self.control_kind not in ("native_proxy", "direct_nccl", "shared_geometry_nccl", "exact_nccl"):
                 raise ValueError("width balance requires native_proxy or NCCL packet control")
             if self.scheduler != "edge_stream_memops":
                 raise ValueError("width balance requires edge_stream_memops")
@@ -1545,6 +1545,10 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             )
             if self.control_kind == "graph_proxy":
                 self.control = GraphP2PA2AScheduler(self.transport)
+            elif self.control_kind == "shared_geometry_nccl":
+                from ce_a2a_moe.shared_geometry_nccl import SharedGeometryNcclScheduler
+                self.control = SharedGeometryNcclScheduler(
+                    process_group=self.device_group)
             elif self.control_kind == "direct_nccl":
                 from ce_a2a_moe.direct_nccl import DirectSlotNcclPacketScheduler
                 self.control = DirectSlotNcclPacketScheduler(process_group=self.device_group)
@@ -1886,7 +1890,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             return lambda: None
         submit_options = {}
         if geometry_stage is not None:
-            if self.control_kind != "native_proxy":
+            if self.control_kind not in ("native_proxy", "shared_geometry_nccl"):
                 raise RuntimeError(
                     "early geometry staging requires native proxy control"
                 )
@@ -1900,7 +1904,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             submit_options["global_count_matrix_transposed"] = (
                 global_count_matrix_transposed
             )
-        if self.control_kind not in ("native_proxy", "exact_nccl", "direct_nccl"):
+        if self.control_kind not in ("native_proxy", "exact_nccl", "direct_nccl", "shared_geometry_nccl"):
             submit_args = (
                 "dispatch" if phase == 0 else "combine",
                 send,
@@ -1930,7 +1934,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 **submit_options,
             )
         # Only controls with a per-edge width ABI may carry adaptive packets.
-        if self.control_kind not in ("native_proxy", "exact_nccl", "direct_nccl"):
+        if self.control_kind not in ("native_proxy", "exact_nccl", "direct_nccl", "shared_geometry_nccl"):
             raise RuntimeError(
                 "variable-width PACE needs VLLM_CE_A2A_CONTROL=native_proxy "
                 f"or exact_nccl, "
@@ -2012,7 +2016,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         return receiver()
 
     def supports_async(self) -> bool:
-        return self.async_split and self.control_kind in ("native_proxy", "exact_nccl", "direct_nccl")
+        return self.async_split and self.control_kind in ("native_proxy", "exact_nccl", "direct_nccl", "shared_geometry_nccl")
 
     def dispatch_async(
         self,
@@ -2308,7 +2312,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 assert self.dispatch_recv_row_bytes is not None
                 dispatch_send_row_bytes = self.dispatch_send_row_bytes
                 dispatch_recv_row_bytes = self.dispatch_recv_row_bytes
-                if self.control_kind == "native_proxy":
+                if self.control_kind in ("native_proxy", "shared_geometry_nccl"):
                     assert self.control is not None
                     dispatch_geometry_stage = self.control.begin_geometry_stage(
                         "dispatch",
@@ -2726,7 +2730,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 assert self.combine_recv_row_bytes is not None
                 combine_width_send_row_bytes = self.combine_send_row_bytes
                 combine_width_recv_row_bytes = self.combine_recv_row_bytes
-                if self.control_kind == "native_proxy":
+                if self.control_kind in ("native_proxy", "shared_geometry_nccl"):
                     combine_geometry_stage = self.control.begin_geometry_stage(
                         "combine",
                         combine_control_send_counts,
