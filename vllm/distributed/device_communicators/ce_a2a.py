@@ -585,6 +585,13 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         self.width_balance = bool(
             self.width_balance_min_bits or self.width_balance_max_bits
         )
+        if self.backend_caps.requires_explicit_byte_widths and not (
+            self.width_balance and self.dispatch_bits and self.combine_bits
+        ):
+            raise ValueError(
+                f"{self.control_kind} currently requires matched multirung "
+                "UINT8 packets with explicit widths; use --policy uniform|ew|ew-d"
+            )
         if self.width_balance and not (
             4 <= self.width_balance_min_bits <= 6 <= self.width_balance_max_bits <= 8
         ):

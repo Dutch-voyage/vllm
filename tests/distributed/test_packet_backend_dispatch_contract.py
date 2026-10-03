@@ -90,3 +90,44 @@ def test_unsupported_variable_width_rejected_before_submit():
     with pytest.raises(RuntimeError):
         obj._launch_fixed_exchange(0, None, None, None, None, object(), object())
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "width_balance,dispatch,combine,accepted",
+    [
+        (True, 4, 4, True),
+        (False, 6, 6, False),
+        (True, 0, 4, False),
+        (True, 4, 0, False),
+    ],
+)
+def test_native_nccl_requires_explicit_byte_packets(
+    width_balance, dispatch, combine, accepted
+):
+    source = (
+        Path(__file__).parents[2] / "vllm/distributed/device_communicators/ce_a2a.py"
+    )
+    tree = ast.parse(source.read_text())
+    guard = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.If)
+        and "self.backend_caps.requires_explicit_byte_widths" in ast.unparse(n.test)
+    )
+    obj = SimpleNamespace(
+        backend_caps=SimpleNamespace(requires_explicit_byte_widths=True),
+        width_balance=width_balance,
+        dispatch_bits=dispatch,
+        combine_bits=combine,
+        control_kind="nccl_bridge",
+    )
+    code = compile(
+        ast.fix_missing_locations(ast.Module(body=[guard], type_ignores=[])),
+        str(source),
+        "exec",
+    )
+    if accepted:
+        exec(code, {"self": obj})
+    else:
+        with pytest.raises(ValueError, match="explicit widths"):
+            exec(code, {"self": obj})
