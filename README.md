@@ -1,4 +1,4 @@
-> **EdgeWeave paper reproduction:** the measured implementation is on [`paper/reproduce-edgeweave-20260907`](https://github.com/Dutch-voyage/vllm/tree/paper/reproduce-edgeweave-20260907), with [exact source pins and build guidance](https://github.com/Dutch-voyage/vllm/blob/paper/reproduce-edgeweave-20260907/EDGEWEAVE_REPRODUCE.md). The [PACE reproduction package](https://github.com/Dutch-voyage/PACE/blob/main/reproduction/README.md) contains commands and inputs for each result. This `main` branch retains upstream code.
+> **EdgeWeave paper reproduction:** the latest verified transport integration is on [`paper/verified-20261003`](https://github.com/Dutch-voyage/vllm/tree/paper/verified-20261003). Use the [PACE source-pair and evidence guide](https://github.com/Dutch-voyage/PACE/blob/main/docs/verified-20261003/README.md) and its pinned vLLM submodule. The [September 7 branch](https://github.com/Dutch-voyage/vllm/tree/paper/reproduce-edgeweave-20260907) remains a historical checkpoint. This `main` branch retains upstream code.
 
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
