@@ -1,3 +1,9 @@
+> **Interface development branch:** this branch adds a capability-based PACE
+> packet-backend registry. Use the matching PACE `refactor/backend-interface`
+> branch. CPU dispatch-contract tests pass, but full CUDA/vLLM regression is
+> pending. Frozen `verified-20261003` remains the measured release; do not use
+> this refactor to relabel existing experiment results.
+
 # Verified EdgeWeave integration — October 3, 2026
 
 This branch publishes measured source `60e2b78937b80dffe5c7e4bfe2a678f4d213c55c`

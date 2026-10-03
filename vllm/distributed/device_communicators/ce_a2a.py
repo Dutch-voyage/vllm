@@ -551,18 +551,22 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             raise ValueError(
                 "VLLM_CE_A2A_PACKET_BUILDER must be reference, fixed, or fused"
             )
+        from ce_a2a_moe.backends import (
+            Capabilities, LEGACY_CONTROLS, get_backend, load_backend_plugins,
+        )
+        load_backend_plugins(os.getenv("VLLM_CE_A2A_BACKEND_MODULE", ""))
         self.control_kind = envs.VLLM_CE_A2A_CONTROL
-        if self.control_kind not in (
-            "host_sync",
-            "device_proxy",
-            "native_proxy",
-            "graph_proxy",
-            "exact_nccl", "direct_nccl", "shared_geometry_nccl",
-        ):
-            raise ValueError(
-                "VLLM_CE_A2A_CONTROL must be host_sync, device_proxy, or "
-                "native_proxy, graph_proxy, or exact_nccl"
-            )
+        self.backend_spec = (
+            None if self.control_kind in LEGACY_CONTROLS
+            else get_backend(self.control_kind)
+        )
+        if self.backend_spec is not None:
+            self.control_kind = self.backend_spec.name
+        self.backend_caps = (
+            self.backend_spec.capabilities if self.backend_spec is not None
+            else Capabilities(async_packets=False, variable_widths=False,
+                              phase_balanced_layout=False)
+        )
         if self.control_kind != "host_sync" and self.packet_builder_kind != "fused":
             raise ValueError("proxy control requires the fused packet builder")
         self.dispatch_bits = _codec_bits(
@@ -610,12 +614,12 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 raise ValueError(f"unsupported CE edge schedule {self.edge_schedule!r}")
             if self.world_size != 8:
                 raise ValueError("adaptive dual-NUMA scheduling requires EP8")
-            if self.control_kind != "native_proxy" and not (
-                self.control_kind in ("direct_nccl", "shared_geometry_nccl")
+            if not self.backend_caps.adaptive_schedule and not (
+                self.backend_caps.phase_balanced_layout
                 and self.edge_schedule == "ep8_dual_numa_phase_balanced_v1"
             ):
                 raise ValueError(
-                    "topology edge scheduling requires native_proxy or direct_nccl"
+                    "backend does not support the requested topology layout/schedule"
                 )
             if self.scheduler != "edge_stream_memops":
                 raise ValueError("topology edge scheduling requires edge_stream_memops")
@@ -656,13 +660,9 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             raise ValueError("DELTA_MAX_EDGE builds on delta dispatch")
         if self.delta_max_edge and self.dispatch_bits != 5:
             raise ValueError("DELTA_MAX_EDGE implements the locked INT5-to-INT6 arm")
-        if self.delta_max_edge and self.control_kind not in (
-            "native_proxy",
-            "exact_nccl", "direct_nccl", "shared_geometry_nccl",
-        ):
+        if self.delta_max_edge and not self.backend_caps.variable_widths:
             raise ValueError(
-                "DELTA_MAX_EDGE uses per-edge row widths and needs native_proxy "
-                "or exact_nccl"
+                "DELTA_MAX_EDGE requires a variable-width packet backend"
             )
         self.delta_probe = bool(
             int(os.environ.get("VLLM_CE_A2A_DELTA_PROBE", "0") or 0)
@@ -760,8 +760,8 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 raise ValueError("width balance currently supports EP4 or EP8")
             if self.packet_builder_kind != "fused":
                 raise ValueError("width balance requires the fused packet builder")
-            if self.control_kind not in ("native_proxy", "direct_nccl", "shared_geometry_nccl", "exact_nccl"):
-                raise ValueError("width balance requires native_proxy or NCCL packet control")
+            if not self.backend_caps.variable_widths:
+                raise ValueError("backend does not support variable-width packets")
             if self.scheduler != "edge_stream_memops":
                 raise ValueError("width balance requires edge_stream_memops")
             expected_schedule = (
@@ -1172,11 +1172,9 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             CoalescedCeTransport,
             DeviceCountCeScheduler,
             DispatchPacketSpec,
-            ExactNcclPacketScheduler,
             FixedBlockDispatchBuilder,
             FusedBlockDispatchBuilder,
             GraphP2PA2AScheduler,
-            NativeDeviceCountCeScheduler,
             lowbit_block_payload_bytes,
         )
 
@@ -1335,7 +1333,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                     dtype=dispatch_wire_dtype,
                     device=torch.accelerator.current_device_index(),
                 )
-        direct_inbox_receive = self.control_kind == "native_proxy"
+        direct_inbox_receive = self.backend_caps.ce_inbox
         self.transport = CoalescedCeTransport(
             # The packet ABI reserves one sentinel row. With a compact
             # symmetric-inbox stride, that inbox is also the contiguous fixed
@@ -1543,70 +1541,64 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 self.world_size,
                 envs.VLLM_CE_A2A_PROXY_CPU_MAP,
             )
+            schedule_options = {}
+            if self.edge_schedule == "ep8_dual_numa_adaptive_v1":
+                from ce_a2a_moe.schedule import edge_schedule_banks
+
+                dispatch_bank, combine_bank = edge_schedule_banks(
+                    self.edge_schedule, self.world_size
+                )
+                schedule_options = {
+                    "dispatch_edge_schedule_bank": dispatch_bank,
+                    "combine_edge_schedule_bank": combine_bank,
+                    "adaptive_schedule_numa_split": self.world_size // 2,
+                    "adaptive_dispatch_width_model": (
+                        (
+                            self.dispatch_floor_row,
+                            self.dispatch_ladder_step,
+                            self.dispatch_groups,
+                        )
+                        if self.delta_max_edge
+                        else None
+                    ),
+                    "adaptive_combine_width_model": (
+                        (
+                            self.combine_floor_row,
+                            self.combine_ladder_step,
+                            self.combine_groups,
+                        )
+                        if self.combine_fill
+                        else None
+                    ),
+                }
+            elif self.edge_schedule == "ep8_dual_numa_phase_balanced_v1":
+                from ce_a2a_moe.schedule import edge_schedules
+
+                dispatch_schedule, combine_schedule = edge_schedules(
+                    self.edge_schedule, self.world_size
+                )
+                schedule_options = {
+                    "dispatch_edge_schedule": dispatch_schedule,
+                    "combine_edge_schedule": combine_schedule,
+                }
+            native_options = dict(
+                ring_depth=envs.VLLM_CE_A2A_CONTROL_RING_DEPTH,
+                submission_window=envs.VLLM_CE_A2A_PROXY_WINDOW,
+                proxy_cpu=proxy_cpu,
+                **schedule_options,
+            )
             if self.control_kind == "graph_proxy":
                 self.control = GraphP2PA2AScheduler(self.transport)
-            elif self.control_kind == "shared_geometry_nccl":
-                from ce_a2a_moe.shared_geometry_nccl import SharedGeometryNcclScheduler
-                self.control = SharedGeometryNcclScheduler(
-                    process_group=self.device_group)
-            elif self.control_kind == "direct_nccl":
-                from ce_a2a_moe.direct_nccl import DirectSlotNcclPacketScheduler
-                self.control = DirectSlotNcclPacketScheduler(process_group=self.device_group)
-            elif self.control_kind == "exact_nccl":
-                self.control = ExactNcclPacketScheduler(process_group=self.device_group)
+            elif self.backend_spec is not None:
+                from ce_a2a_moe.backends import BackendContext, create_backend
+                self.control = create_backend(
+                    self.control_kind,
+                    BackendContext(process_group=self.device_group,
+                                   ce_transport=self.transport,
+                                   native_options=native_options),
+                )
             else:
-                control_type = (
-                    NativeDeviceCountCeScheduler
-                    if self.control_kind == "native_proxy"
-                    else DeviceCountCeScheduler
-                )
-                schedule_options = {}
-                if self.edge_schedule == "ep8_dual_numa_adaptive_v1":
-                    from ce_a2a_moe.schedule import edge_schedule_banks
-
-                    dispatch_bank, combine_bank = edge_schedule_banks(
-                        self.edge_schedule, self.world_size
-                    )
-                    schedule_options = {
-                        "dispatch_edge_schedule_bank": dispatch_bank,
-                        "combine_edge_schedule_bank": combine_bank,
-                        "adaptive_schedule_numa_split": self.world_size // 2,
-                        "adaptive_dispatch_width_model": (
-                            (
-                                self.dispatch_floor_row,
-                                self.dispatch_ladder_step,
-                                self.dispatch_groups,
-                            )
-                            if self.delta_max_edge
-                            else None
-                        ),
-                        "adaptive_combine_width_model": (
-                            (
-                                self.combine_floor_row,
-                                self.combine_ladder_step,
-                                self.combine_groups,
-                            )
-                            if self.combine_fill
-                            else None
-                        ),
-                    }
-                elif self.edge_schedule == "ep8_dual_numa_phase_balanced_v1":
-                    from ce_a2a_moe.schedule import edge_schedules
-
-                    dispatch_schedule, combine_schedule = edge_schedules(
-                        self.edge_schedule, self.world_size
-                    )
-                    schedule_options = {
-                        "dispatch_edge_schedule": dispatch_schedule,
-                        "combine_edge_schedule": combine_schedule,
-                    }
-                self.control = control_type(
-                    self.transport,
-                    ring_depth=envs.VLLM_CE_A2A_CONTROL_RING_DEPTH,
-                    submission_window=envs.VLLM_CE_A2A_PROXY_WINDOW,
-                    proxy_cpu=proxy_cpu,
-                    **schedule_options,
-                )
+                self.control = DeviceCountCeScheduler(self.transport, **native_options)
             if self.control_kind == "graph_proxy":
                 self._control_handle = id(self.control)
                 _GRAPH_CONTROLS[self._control_handle] = self.control
@@ -1724,7 +1716,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             )
             self.fill_count_recv = torch.empty_like(self.fill_count_send)
 
-        direct_inbox_receive = self.control_kind == "native_proxy"
+        direct_inbox_receive = self.backend_caps.ce_inbox
         self.dispatch_recv_blocks = (
             self.transport._inbox_view(
                 self.transport.dispatch_inbox,
@@ -1890,13 +1882,13 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             return lambda: None
         submit_options = {}
         if geometry_stage is not None:
-            if self.control_kind not in ("native_proxy", "shared_geometry_nccl"):
+            if not self.backend_caps.early_geometry:
                 raise RuntimeError(
                     "early geometry staging requires native proxy control"
                 )
             submit_options["geometry_stage"] = geometry_stage
         if global_count_matrix is not None:
-            if self.control_kind != "native_proxy":
+            if not self.backend_caps.adaptive_schedule:
                 raise RuntimeError(
                     "adaptive edge scheduling requires native proxy control"
                 )
@@ -1904,7 +1896,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
             submit_options["global_count_matrix_transposed"] = (
                 global_count_matrix_transposed
             )
-        if self.control_kind not in ("native_proxy", "exact_nccl", "direct_nccl", "shared_geometry_nccl"):
+        if not self.backend_caps.async_packets:
             submit_args = (
                 "dispatch" if phase == 0 else "combine",
                 send,
@@ -1934,11 +1926,9 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 **submit_options,
             )
         # Only controls with a per-edge width ABI may carry adaptive packets.
-        if self.control_kind not in ("native_proxy", "exact_nccl", "direct_nccl", "shared_geometry_nccl"):
+        if not self.backend_caps.variable_widths:
             raise RuntimeError(
-                "variable-width PACE needs VLLM_CE_A2A_CONTROL=native_proxy "
-                f"or exact_nccl, "
-                f"got {self.control_kind}"
+                f"backend {self.control_kind} does not support variable-width packets"
             )
         return self.control.submit_async(
             "dispatch" if phase == 0 else "combine",
@@ -2016,7 +2006,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
         return receiver()
 
     def supports_async(self) -> bool:
-        return self.async_split and self.control_kind in ("native_proxy", "exact_nccl", "direct_nccl", "shared_geometry_nccl")
+        return self.async_split and self.backend_caps.async_packets
 
     def dispatch_async(
         self,
@@ -2312,7 +2302,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 assert self.dispatch_recv_row_bytes is not None
                 dispatch_send_row_bytes = self.dispatch_send_row_bytes
                 dispatch_recv_row_bytes = self.dispatch_recv_row_bytes
-                if self.control_kind in ("native_proxy", "shared_geometry_nccl"):
+                if self.backend_caps.early_geometry:
                     assert self.control is not None
                     dispatch_geometry_stage = self.control.begin_geometry_stage(
                         "dispatch",
@@ -2730,7 +2720,7 @@ class CeA2AAll2AllManager(All2AllManagerBase):
                 assert self.combine_recv_row_bytes is not None
                 combine_width_send_row_bytes = self.combine_send_row_bytes
                 combine_width_recv_row_bytes = self.combine_recv_row_bytes
-                if self.control_kind in ("native_proxy", "shared_geometry_nccl"):
+                if self.backend_caps.early_geometry:
                     combine_geometry_stage = self.control.begin_geometry_stage(
                         "combine",
                         combine_control_send_counts,

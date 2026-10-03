@@ -200,9 +200,7 @@ if TYPE_CHECKING:
     VLLM_CE_A2A_PACKET_BUILDER: Literal[
         "reference", "fixed", "fused"
     ] = "reference"
-    VLLM_CE_A2A_CONTROL: Literal[
-        "host_sync", "device_proxy", "native_proxy", "graph_proxy"
-    ] = "host_sync"
+    VLLM_CE_A2A_CONTROL: str = "host_sync"
     VLLM_CE_A2A_CONTROL_RING_DEPTH: int = 128
     VLLM_CE_A2A_PROXY_CPU: int = -1
     VLLM_CE_A2A_PROXY_CPU_MAP: str = ""
@@ -1591,17 +1589,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "reference",
         ["reference", "fixed", "fused"],
     ),
-    "VLLM_CE_A2A_CONTROL": env_with_choices(
-        "VLLM_CE_A2A_CONTROL",
-        "host_sync",
-        [
-            "host_sync",
-            "device_proxy",
-            "native_proxy",
-            "graph_proxy",
-            "exact_nccl", "direct_nccl", "shared_geometry_nccl",
-        ],
-    ),
+    # Validate against the PACE registry after worker-local plugins are imported.
+    "VLLM_CE_A2A_CONTROL": lambda: os.getenv("VLLM_CE_A2A_CONTROL", "host_sync"),
     "VLLM_CE_A2A_CONTROL_RING_DEPTH": lambda: int(
         os.getenv("VLLM_CE_A2A_CONTROL_RING_DEPTH", "128")
     ),

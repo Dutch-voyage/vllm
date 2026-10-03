@@ -53,6 +53,7 @@ def test_dbo_lane_receive_buffers_preserve_codec_sentinel_row(
         _owner=object(),
         _lane_id=1,
         control_kind=control_kind,
+        backend_caps=__import__("ce_a2a_moe.backends", fromlist=["get_backend"]).get_backend(control_kind).capabilities,
         transport=SimpleNamespace(
             _inbox_view=inbox_view, dispatch_inbox=object(), combine_inbox=object()
         ),
@@ -87,7 +88,7 @@ def test_dbo_lane_receive_buffers_preserve_codec_sentinel_row(
     assert inbox_lanes == ([1, 1] if control_kind == "native_proxy" else [])
 
 
-@pytest.mark.parametrize("control_kind", ["native_proxy", "exact_nccl"])
+@pytest.mark.parametrize("control_kind", ["native_proxy", "exact_nccl", "direct_nccl", "shared_geometry_nccl", "custom_backend"])
 def test_packet_backend_defers_receive_dependency_to_returned_hook(
     control_kind: str,
 ) -> None:
@@ -104,6 +105,9 @@ def test_packet_backend_defers_receive_dependency_to_returned_hook(
     manager = CeA2AAll2AllManager.__new__(CeA2AAll2AllManager)
     manager.control = Control()
     manager.control_kind = control_kind
+    from ce_a2a_moe.backends import Capabilities, get_backend
+    manager.backend_caps = (Capabilities(variable_widths=True) if control_kind == "custom_backend"
+                            else get_backend(control_kind).capabilities)
     manager._lane_id = 1
     manager.async_split = True
     packets = torch.zeros((2, 1, 4), dtype=torch.uint8)
