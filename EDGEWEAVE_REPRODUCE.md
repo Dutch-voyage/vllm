@@ -1,3 +1,22 @@
+# Verified EdgeWeave integration — October 3, 2026
+
+This branch publishes measured source `60e2b78937b80dffe5c7e4bfe2a678f4d213c55c`
+with updated documentation. It supports matched-codec direct-slot NCCL and shared
+pinned geometry with an ordered NCCL issuer. PACE keeps its native C++ proxy;
+this does not make their submission implementations identical.
+
+Use the PACE repository's pinned `vendor/vllm` and
+[verified source/evidence guide](https://github.com/Dutch-voyage/PACE/blob/main/docs/verified-20261003/README.md).
+The paired PACE sources are `a7ee24a` for shared-geometry serving and `9e85f1b`
+for the later issuer-affinity diagnostic. GPU correctness and serving checks
+were completed in those frozen campaigns; this documentation publication does
+not rerun them. Build instructions are in the PACE installation guide.
+
+The September 7 branch and documentation below are historical. Their references
+to "current" results apply only to that checkpoint, not the October release.
+
+---
+
 # EdgeWeave: vLLM experiment integration
 
 This branch contains the exact serving implementation used by **EdgeWeave: Redistributing Communication Precision for MoE Inference**, plus reproduction documentation. Start with the [PACE reproduction guide](https://github.com/Dutch-voyage/PACE/blob/main/reproduction/README.md), which includes 105 recorded commands, source-pair selection, frozen request/routing inputs, expected results, and offline table generation.
