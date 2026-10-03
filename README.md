@@ -1,5 +1,11 @@
 > **EdgeWeave paper reproduction:** the latest verified transport integration is on [`paper/verified-20261003`](https://github.com/Dutch-voyage/vllm/tree/paper/verified-20261003). Use the [PACE source-pair and evidence guide](https://github.com/Dutch-voyage/PACE/blob/main/docs/verified-20261003/README.md) and its pinned vLLM submodule. The [September 7 branch](https://github.com/Dutch-voyage/vllm/tree/paper/reproduce-edgeweave-20260907) remains a historical checkpoint. This `main` branch retains upstream code.
 
+> **Backend interface development:** use the paired PACE and vLLM
+> [`refactor/backend-interface`](https://github.com/Dutch-voyage/vllm/tree/refactor/backend-interface)
+> branches for pluggable CE/NCCL selection and optional C++ NCCL submission.
+> [Build and validation status](https://github.com/Dutch-voyage/PACE/blob/refactor/backend-interface/docs/nccl-backends.md).
+> Packaged GPU integration is under qualification; the verified release remains separate.
+
 <!-- markdownlint-disable MD001 MD041 -->
 <p align="center">
   <picture>
